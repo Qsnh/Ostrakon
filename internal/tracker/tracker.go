@@ -71,9 +71,9 @@ type ipState struct {
 	events   []event.Event
 	inFlight bool // a Batch was handed out and neither Done nor Forget has followed
 
-	benign         bool      // a benign verdict is cached
-	benignRelevant int       // relevant events in the window when it was cached
-	benignUntil    time.Time // last event time at caching + BenignTTL
+	benign      bool      // a benign verdict is cached
+	benignBase  counts    // the window's tallies when it was cached
+	benignUntil time.Time // last event time at caching + BenignTTL
 }
 
 // counts are the per-source tallies the trigger rules look at.
@@ -83,12 +83,13 @@ type counts struct {
 	nginxTotal    int
 }
 
-func (c counts) relevant() int { return c.sshdRelevant + c.nginxRelevant }
-
-func (c counts) triggers() bool {
-	return c.sshdRelevant >= sshdRelevantTrigger ||
-		c.nginxRelevant >= nginxRelevantTrigger ||
-		c.nginxTotal >= nginxVolumeTrigger
+// triggersAbove reports whether some trigger condition holds and, for that
+// same condition, the count is at least double what base recorded. With a zero
+// base this is the plain trigger rule.
+func (c counts) triggersAbove(base counts) bool {
+	return (c.sshdRelevant >= sshdRelevantTrigger && c.sshdRelevant >= 2*base.sshdRelevant) ||
+		(c.nginxRelevant >= nginxRelevantTrigger && c.nginxRelevant >= 2*base.nginxRelevant) ||
+		(c.nginxTotal >= nginxVolumeTrigger && c.nginxTotal >= 2*base.nginxTotal)
 }
 
 // New returns an empty Tracker.
@@ -149,11 +150,11 @@ func (t *Tracker) Add(ev event.Event) (Batch, bool) {
 	if st.benign && !now.Before(st.benignUntil) {
 		st.benign = false
 	}
-	c := st.count()
-	if !c.triggers() {
-		return Batch{}, false
+	var base counts
+	if st.benign {
+		base = st.benignBase
 	}
-	if st.benign && c.relevant() < 2*st.benignRelevant {
+	if !st.count().triggersAbove(base) {
 		return Batch{}, false
 	}
 	st.inFlight = true
@@ -161,11 +162,12 @@ func (t *Tracker) Add(ev event.Event) (Batch, bool) {
 }
 
 // Done ends the decision started by Add. With benign=true the verdict is
-// cached: the IP is not triggered again until BenignTTL after its last event
-// or until its relevant event count doubles, whichever comes first. With
-// benign=false (a ban is followed by Forget; an error means retry) any earlier
-// cache is left as it was. Unknown IPs and IPs with an empty window cache
-// nothing.
+// cached: until BenignTTL after its last event, a trigger condition only fires
+// again once its own count (sshd relevant, nginx 4xx or nginx total) has at
+// least doubled since now, so web traffic cannot buy an SSH attacker a free
+// pass or the other way round. With benign=false (a ban is followed by Forget;
+// an error means retry) any earlier cache is left as it was. Unknown IPs and
+// IPs with an empty window cache nothing.
 func (t *Tracker) Done(ip netip.Addr, benign bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -177,7 +179,7 @@ func (t *Tracker) Done(ip netip.Addr, benign bool) {
 	st.inFlight = false
 	if benign && len(st.events) > 0 {
 		st.benign = true
-		st.benignRelevant = st.count().relevant()
+		st.benignBase = st.count()
 		st.benignUntil = st.newest().Add(t.cfg.BenignTTL)
 	}
 	t.dropIfIdle(el)

@@ -224,7 +224,7 @@ func TestInFlight(t *testing.T) {
 }
 
 func TestBenignCache(t *testing.T) {
-	t.Run("needs doubled relevant total", func(t *testing.T) {
+	t.Run("ssh trigger cached: needs a doubled ssh count", func(t *testing.T) {
 		tr := New(DefaultConfig())
 		mustNotTrigger(t, tr, sshFail(ipA, 0))
 		mustNotTrigger(t, tr, sshFail(ipA, sec(1)))
@@ -266,17 +266,17 @@ func TestBenignCache(t *testing.T) {
 		mustNotTrigger(t, tr, sshFail(ipA, base+sec(1)+time.Millisecond))
 	})
 
-	t.Run("doubling alone is not enough without a trigger condition", func(t *testing.T) {
+	t.Run("a cached IP below every trigger condition stays quiet", func(t *testing.T) {
 		tr := New(DefaultConfig())
 		mustNotTrigger(t, tr, sshFail(ipA, 0))
 		mustNotTrigger(t, tr, sshFail(ipA, sec(1)))
 		tr.Done(ipA, true) // cache N=2 without ever triggering
-		// Relevant total reaches 4 but neither sshd (2) nor nginx (2) crosses its threshold.
+		// Neither sshd (2) nor nginx 4xx (2) crosses its threshold.
 		mustNotTrigger(t, tr, web(ipA, sec(2), 404))
 		mustNotTrigger(t, tr, web(ipA, sec(3), 404))
 	})
 
-	t.Run("a later Done replaces the cached total", func(t *testing.T) {
+	t.Run("a later Done replaces the cached counts", func(t *testing.T) {
 		tr := New(DefaultConfig())
 		for i := 0; i < 2; i++ {
 			mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
@@ -292,6 +292,59 @@ func TestBenignCache(t *testing.T) {
 			mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
 		}
 		mustTrigger(t, tr, sshFail(ipA, sec(11))) // 12 = 2*6
+	})
+
+	t.Run("volume trigger cached: more of the same stays quiet", func(t *testing.T) {
+		tr := New(DefaultConfig())
+		for i := 1; i < 300; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 200))
+		}
+		mustTrigger(t, tr, web(ipA, sec(300), 200))
+		tr.Done(ipA, true) // T=300, S=0, F=0
+		for i := 301; i <= 400; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 200))
+		}
+	})
+
+	t.Run("volume trigger cached: ssh failures still trigger", func(t *testing.T) {
+		tr := New(DefaultConfig())
+		for i := 1; i < 300; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 200))
+		}
+		mustTrigger(t, tr, web(ipA, sec(300), 200))
+		tr.Done(ipA, true)
+		mustNotTrigger(t, tr, sshFail(ipA, sec(301)))
+		mustNotTrigger(t, tr, sshFail(ipA, sec(302)))
+		b := mustTrigger(t, tr, sshFail(ipA, sec(303)))
+		if len(b.Events) != 50 || b.Events[len(b.Events)-1].Source != "sshd" {
+			t.Errorf("batch has %d events ending in %q, want 50 ending in sshd", len(b.Events), b.Events[len(b.Events)-1].Source)
+		}
+	})
+
+	t.Run("volume trigger cached: 4xx burst still triggers", func(t *testing.T) {
+		tr := New(DefaultConfig())
+		for i := 1; i < 300; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 200))
+		}
+		mustTrigger(t, tr, web(ipA, sec(300), 200))
+		tr.Done(ipA, true)
+		for i := 301; i < 310; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 404))
+		}
+		mustTrigger(t, tr, web(ipA, sec(310), 404))
+	})
+
+	t.Run("4xx trigger cached: needs a doubled 4xx count", func(t *testing.T) {
+		tr := New(DefaultConfig())
+		for i := 0; i < 9; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 404))
+		}
+		mustTrigger(t, tr, web(ipA, sec(9), 404))
+		tr.Done(ipA, true) // F=10
+		for i := 10; i < 19; i++ {
+			mustNotTrigger(t, tr, web(ipA, sec(i), 404)) // F up to 19: not yet 2F
+		}
+		mustTrigger(t, tr, web(ipA, sec(19), 404)) // F=20
 	})
 
 	t.Run("Done false keeps the cache", func(t *testing.T) {
