@@ -6,6 +6,8 @@ package source
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"time"
 )
@@ -71,7 +73,7 @@ func Start(ctx context.Context, specs []Spec, out chan<- Line, log *slog.Logger)
 		go forward(ctx, spec, raw, out)
 		switch {
 		case spec.Path != "":
-			go func() { _ = TailFile(ctx, spec.Path, filePoll, raw) }()
+			go func() { _ = tailFile(ctx, spec.Path, filePoll, raw, fileProblemLogger(log, spec)) }()
 		case len(spec.JournalUnits) > 0:
 			go func() {
 				_ = tailJournal(ctx, spec.JournalUnits, raw, func(err error) {
@@ -80,6 +82,23 @@ func Start(ctx context.Context, specs []Spec, out chan<- Line, log *slog.Logger)
 						"err", err, "retry_in", journalRestartDelay)
 				})
 			}()
+		}
+	}
+}
+
+// fileProblemLogger returns the tailFile hook that reports a file source's
+// health to log. Each call marks a change, never a repeat: a file that does not
+// exist yet is normal waiting (Info), any other failure is a Warn because the
+// detector is blind to that log until it clears, and nil means it cleared.
+func fileProblemLogger(log *slog.Logger, spec Spec) func(error) {
+	return func(err error) {
+		switch {
+		case err == nil:
+			log.Info("log file is available; following it", "source", spec.Name, "path", spec.Path)
+		case errors.Is(err, fs.ErrNotExist):
+			log.Info("log file does not exist yet; waiting for it", "source", spec.Name, "path", spec.Path)
+		default:
+			log.Warn("cannot read log file; will keep retrying", "source", spec.Name, "path", spec.Path, "err", err)
 		}
 	}
 }

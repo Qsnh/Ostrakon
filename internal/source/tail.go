@@ -3,7 +3,9 @@ package source
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"time"
 )
@@ -61,6 +63,9 @@ func (s *lineSplitter) flush(emit func(string) bool) bool {
 // discard drops the buffered partial line without emitting it.
 func (s *lineSplitter) discard() { s.buf = s.buf[:0] }
 
+// errStopped is what a poll returns when emit gave up because ctx is done.
+var errStopped = errors.New("source: stopped")
+
 // TailFile follows the file at path and sends each new line to out, without
 // its line terminator. It starts at the end of the file if it exists, and at
 // the beginning of the file once it appears otherwise. It copes with log
@@ -73,26 +78,26 @@ func (s *lineSplitter) discard() { s.buf = s.buf[:0] }
 // every poll. TailFile logs nothing and returns ctx.Err() once ctx is done,
 // which is the only way it returns.
 func TailFile(ctx context.Context, path string, poll time.Duration, out chan<- string) error {
+	return tailFile(ctx, path, poll, out, nil)
+}
+
+// tailFile is TailFile with a hook for problems. When onErr is non-nil it is
+// called, on the tailing goroutine, as the file's health changes and not on
+// every poll: with a non-nil error when a problem first appears or becomes a
+// different one, and with nil once when the problem is gone. A file that does
+// not exist yet is reported (as an error wrapping fs.ErrNotExist) like any
+// other problem; the caller decides how loudly to say so.
+func tailFile(ctx context.Context, path string, poll time.Duration, out chan<- string, onErr func(error)) error {
 	if poll <= 0 {
 		poll = filePoll
 	}
-	t := &tailer{path: path}
+	t := &tailer{path: path, seekEnd: true, onErr: onErr}
 	emit := func(s string) bool {
 		select {
 		case out <- s:
 			return true
 		case <-ctx.Done():
 			return false
-		}
-	}
-
-	// A file that exists now is followed from its end; one that shows up
-	// later is read from the start, so no line written to it is missed.
-	if f, err := os.Open(path); err == nil {
-		if off, err := f.Seek(0, io.SeekEnd); err == nil {
-			t.cur, t.off = f, off
-		} else {
-			_ = f.Close()
 		}
 	}
 	defer func() {
@@ -104,7 +109,9 @@ func TailFile(ctx context.Context, path string, poll time.Duration, out chan<- s
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
-		t.poll(emit)
+		if err := t.poll(emit); !errors.Is(err, errStopped) {
+			t.report(err)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -113,81 +120,130 @@ func TailFile(ctx context.Context, path string, poll time.Duration, out chan<- s
 	}
 }
 
-// tailer is the state of one TailFile: the open file, how far it has been
-// read, and the line being assembled.
+// tailer is the state of one tailFile: the open file, how far it has been
+// read, the line being assembled, and the last problem reported.
 type tailer struct {
 	path string
 	cur  *os.File // nil until the path can be opened
 	off  int64    // bytes of cur consumed so far
 	ls   lineSplitter
+
+	// seekEnd is true until the first file is opened (or found missing): a
+	// file that is there when the tail starts is followed from its end, even
+	// if it only becomes readable later. One that shows up afterwards is
+	// read from the start, so none of its lines are missed.
+	seekEnd bool
+
+	onErr   func(error)
+	failed  bool
+	lastErr string
 }
 
-// poll does one round: pick up rotation, then read what is new. emit
-// returning false (ctx done) just ends the round early.
-func (t *tailer) poll(emit func(string) bool) {
-	if t.cur == nil {
-		t.open(emit)
+// report tells onErr about a change in health: err is the outcome of the last
+// poll, nil when it went fine.
+func (t *tailer) report(err error) {
+	if t.onErr == nil {
 		return
+	}
+	switch {
+	case err == nil && t.failed:
+		t.failed, t.lastErr = false, ""
+		t.onErr(nil)
+	case err != nil && (!t.failed || t.lastErr != err.Error()):
+		t.failed, t.lastErr = true, err.Error()
+		t.onErr(err)
+	}
+}
+
+// poll does one round: pick up rotation, then read what is new. It returns
+// errStopped if emit gave up (ctx done), another error if the file could not
+// be opened, statted or read, and nil otherwise. Errors are not fatal: the
+// next poll tries again.
+func (t *tailer) poll(emit func(string) bool) error {
+	if t.cur == nil {
+		return t.open(emit)
 	}
 
 	curInfo, err := t.cur.Stat()
 	if err != nil {
-		return
+		return err
 	}
-	// A path that cannot be statted (removed, or permission denied) is not a
-	// reason to leave the file we have open; keep reading it.
-	pathInfo, err := os.Stat(t.path)
-	rotated := err == nil && !os.SameFile(curInfo, pathInfo)
+	// A path that cannot be statted is not a reason to leave the file we
+	// have open; keep reading it. A path that is simply gone is the normal
+	// gap in a delete-and-recreate rotation; any other failure is reported
+	// once the open file has been read.
+	pathInfo, pathErr := os.Stat(t.path)
+	rotated := pathErr == nil && !os.SameFile(curInfo, pathInfo)
+	if errors.Is(pathErr, fs.ErrNotExist) {
+		pathErr = nil
+	}
 
 	if !rotated && curInfo.Size() < t.off {
 		// Truncated in place. The old content is gone, and so is any
 		// partial line of it.
 		if _, err := t.cur.Seek(0, io.SeekStart); err != nil {
-			return
+			return err
 		}
 		t.off = 0
 		t.ls.discard()
 	}
-	if !t.readToEOF(emit) {
-		return
+	if err := t.readToEOF(emit); err != nil {
+		return err
 	}
 	if rotated {
-		t.open(emit)
+		return t.open(emit)
 	}
+	return pathErr
 }
 
-// open switches to the file now at t.path, reading it from the start. A
-// partial last line of the file being left is emitted as-is first. If the
-// path cannot be opened, nothing changes and the next poll tries again.
-func (t *tailer) open(emit func(string) bool) {
+// open opens the file now at t.path. The very first open follows it from its
+// end (see seekEnd); a later one switches to it and reads it from the start,
+// after emitting any partial last line of the file being left. If the path
+// cannot be opened, nothing changes and the next poll tries again.
+func (t *tailer) open(emit func(string) bool) error {
 	f, err := os.Open(t.path)
 	if err != nil {
-		return
+		if errors.Is(err, fs.ErrNotExist) {
+			t.seekEnd = false
+		}
+		return err
+	}
+	if t.seekEnd {
+		off, err := f.Seek(0, io.SeekEnd)
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		t.seekEnd = false
+		t.cur, t.off = f, off
+		return nil
 	}
 	if t.cur != nil {
 		_ = t.cur.Close()
 		if !t.ls.flush(emit) {
 			_ = f.Close()
-			return
+			return errStopped
 		}
 	}
 	t.cur, t.off = f, 0
-	t.readToEOF(emit)
+	return t.readToEOF(emit)
 }
 
 // readToEOF emits every complete line from the current position to the end
-// of t.cur. It returns false if emit asked to stop.
-func (t *tailer) readToEOF(emit func(string) bool) bool {
+// of t.cur. It returns errStopped if emit asked to stop, and any read error.
+func (t *tailer) readToEOF(emit func(string) bool) error {
 	chunk := make([]byte, readChunk)
 	for {
 		n, err := t.cur.Read(chunk)
 		t.off += int64(n)
 		if !t.ls.feed(chunk[:n], emit) {
-			return false
+			return errStopped
+		}
+		if err == io.EOF {
+			return nil
 		}
 		if err != nil {
-			// io.EOF: caught up. Anything else is retried next poll.
-			return true
+			return err
 		}
 	}
 }

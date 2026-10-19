@@ -3,9 +3,11 @@ package source
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -22,10 +24,16 @@ const (
 // is cancelled and waited for when the test ends.
 func startTail(t *testing.T, path string) <-chan string {
 	t.Helper()
+	return startTailHook(t, path, nil)
+}
+
+// startTailHook is startTail with a problem hook (see tailFile).
+func startTailHook(t *testing.T, path string, onErr func(error)) <-chan string {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	out := make(chan string, 16)
 	done := make(chan error, 1)
-	go func() { done <- TailFile(ctx, path, testPoll, out) }()
+	go func() { done <- tailFile(ctx, path, testPoll, out, onErr) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -36,6 +44,44 @@ func startTail(t *testing.T, path string) <-chan string {
 	})
 	time.Sleep(startSettle)
 	return out
+}
+
+// problems records what a tailFile hook is called with.
+type problems struct {
+	mu  sync.Mutex
+	got []error
+}
+
+func (p *problems) add(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.got = append(p.got, err)
+}
+
+func (p *problems) all() []error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]error(nil), p.got...)
+}
+
+// waitCount waits until the hook has been called n times and returns the calls.
+func (p *problems) waitCount(t *testing.T, n int) []error {
+	t.Helper()
+	deadline := time.Now().Add(recvTimeout)
+	for len(p.all()) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("hook called %d times (%v), want %d", len(p.all()), p.all(), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return p.all()
+}
+
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
 }
 
 func recv(t *testing.T, ch <-chan string) string {
@@ -240,5 +286,109 @@ func TestTailReturnsOnCancelEvenWhenOutputBlocked(t *testing.T) {
 		}
 	case <-time.After(recvTimeout):
 		t.Fatal("TailFile did not return after cancel")
+	}
+}
+
+func TestTailReportsMissingFileOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	var p problems
+	out := startTailHook(t, path, p.add)
+
+	time.Sleep(15 * testPoll) // many polls, still one report
+	got := p.all()
+	if len(got) != 1 || !errors.Is(got[0], fs.ErrNotExist) {
+		t.Fatalf("while missing: hook calls = %v, want one fs.ErrNotExist", got)
+	}
+
+	writeFile(t, path, "d\n")
+	if line := recv(t, out); line != "d" {
+		t.Fatalf("got %q, want %q", line, "d")
+	}
+	got = p.waitCount(t, 2)
+	if got[1] != nil {
+		t.Fatalf("recovery call = %v, want nil", got[1])
+	}
+	time.Sleep(5 * testPoll)
+	if n := len(p.all()); n != 2 {
+		t.Fatalf("hook calls = %v, want exactly the report and the recovery", p.all())
+	}
+}
+
+func TestTailReportsUnreadableFileOnceAndDoesNotReplayOnRecovery(t *testing.T) {
+	skipIfRoot(t)
+	path := filepath.Join(t.TempDir(), "log")
+	writeFile(t, path, "old\n")
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	var p problems
+	out := startTailHook(t, path, p.add)
+
+	time.Sleep(15 * testPoll)
+	got := p.all()
+	if len(got) != 1 || !errors.Is(got[0], fs.ErrPermission) {
+		t.Fatalf("while unreadable: hook calls = %v, want one fs.ErrPermission", got)
+	}
+
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.waitCount(t, 2); got[1] != nil {
+		t.Fatalf("recovery call = %v, want nil", got[1])
+	}
+	// The file existed when the tail started, so what was already in it is
+	// history, not replayed now that it can be read.
+	expectNone(t, out)
+	appendFile(t, path, "new\n")
+	if line := recv(t, out); line != "new" {
+		t.Fatalf("got %q, want %q", line, "new")
+	}
+	if n := len(p.all()); n != 2 {
+		t.Fatalf("hook calls = %v, want exactly the report and the recovery", p.all())
+	}
+}
+
+func TestTailRotationIsNotAProblem(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	writeFile(t, path, "0123456789\n")
+	var p problems
+	out := startTailHook(t, path, p.add)
+
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * testPoll) // the gap where the path does not exist
+	writeFile(t, path, "a longer line\n")
+	if line := recv(t, out); line != "a longer line" {
+		t.Fatalf("got %q, want %q", line, "a longer line")
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	appendFile(t, path, "b\n")
+	if line := recv(t, out); line != "b" {
+		t.Fatalf("got %q, want %q", line, "b")
+	}
+	if got := p.all(); len(got) != 0 {
+		t.Fatalf("hook calls = %v, want none", got)
+	}
+}
+
+func TestTailerReportDeduplicates(t *testing.T) {
+	var p problems
+	tl := &tailer{onErr: p.add}
+	a, b := errors.New("a"), errors.New("b")
+	for _, err := range []error{nil, a, a, b, b, nil, nil, a} {
+		tl.report(err)
+	}
+	got := p.all()
+	want := []error{a, b, nil, a}
+	if len(got) != len(want) {
+		t.Fatalf("hook calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("hook calls = %v, want %v", got, want)
+		}
 	}
 }
