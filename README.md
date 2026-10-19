@@ -8,16 +8,23 @@ Unlike fail2ban there are no jails, filters, regexes or thresholds to configure.
 
 - It finds the logs itself: sshd (`/var/log/auth.log`, `/var/log/secure`, or the `ssh`/`sshd` journald units) and nginx (`/var/log/nginx/access.log`). It starts at the end of each file and follows log rotation.
 - When one address becomes active enough (for example a few failed SSH logins within ten minutes), Ostrakon sends its recent events to Jev. Jev decides whether it is an attack and how long to ban it: 10 minutes, 1 hour, 24 hours or 7 days. There are no permanent bans.
+- It looks for logs only when it starts. If you install nginx (or start using another of these logs) later, run `sudo systemctl restart ostrakon`.
 - Bans are elements with a timeout in sets of Ostrakon's own nftables table, `inet ostrakon`. The table drops traffic at prerouting, before Docker's port forwarding, so it also protects published container ports. nftables lifts each ban on time, even if Ostrakon is stopped. Ostrakon leaves your other firewall rules alone.
-- Ostrakon remembers active bans in `/var/lib/ostrakon/state.json` and puts them back after a reboot.
-- Some addresses are never banned and never sent to Jev: loopback, private and link-local ranges, the server's own addresses, addresses with a live login session, addresses that logged in over SSH successfully in the last 24 hours, Cloudflare's ranges, and anything you add with `ostrakon allow`.
+- Ostrakon remembers active bans in `/var/lib/ostrakon/state.json` and puts them back after a reboot, never for longer than the ban was given.
+- If something removes its table while it runs (`nft flush ruleset`, reloading `nftables.service`), Ostrakon notices within a minute, or at its next ban, rebuilds the table and puts the active bans back.
+- Some addresses are never banned and never sent to Jev: loopback, private and link-local ranges, the server's own addresses, the addresses of current terminal login sessions (those in utmp, as `who` shows them), addresses that logged in over SSH successfully in the last 24 hours, Cloudflare's ranges, and anything you add with `ostrakon allow`. SSH connections without a terminal (`scp`, `sftp`, `ssh host command`) are not in utmp, but their successful login exempts the address for 24 hours all the same.
 
 ## Install
 
-You need a Linux server with systemd and nftables (the `nft` command), root access, and a TypeSafe Jev API key.
+You need a Linux server with systemd and nftables (the `nft` command), root access, and a TypeSafe Jev API key. There is no binary release yet, so you build Ostrakon from source, on any machine with Go 1.25.
 
-1. Download the `ostrakon` binary for your architecture onto the server, or build it (see [Building](#building)).
-2. Run setup as root:
+1. Build the binary from a checkout of this repository (see [Building](#building) for other architectures):
+
+   ```sh
+   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ostrakon ./cmd/ostrakon
+   ```
+
+2. Copy `ostrakon` to the server and run setup there as root:
 
    ```sh
    chmod +x ostrakon
@@ -28,6 +35,8 @@ Setup checks that `nft` is available, asks for your Jev API key (or takes it fro
 
 To use a different key later, run `sudo ostrakon setup` again. The service reads the key before every request, so the new key takes effect without a restart.
 
+To upgrade, build the new binary, run `sudo ./ostrakon setup` with it (it replaces `/usr/local/bin/ostrakon`), then `sudo systemctl restart ostrakon`: setup does not restart a service that is already running.
+
 ## Commands
 
 The service's control socket is only open to root, so run these with `sudo`.
@@ -35,14 +44,30 @@ The service's control socket is only open to root, so run these with `sudo`.
 | Command | What it does |
 | --- | --- |
 | `ostrakon setup` | Save your Jev API key, then install and start the service. |
-| `ostrakon status` | Show whether protection is running or paused (and why), the watched logs, the number of bans, and the last decision. |
+| `ostrakon status` | Show whether protection is running, paused or degraded (and why), the watched logs, the number of bans, the last decision and its outcome, the last Jev request, and any firewall error. |
 | `ostrakon bans` | List the active bans with their category and remaining time. |
 | `ostrakon unban <ip>` | Lift the ban on an address. |
-| `ostrakon allow <ip\|cidr>` | Never ban this address or range. |
+| `ostrakon allow <ip\|cidr>` | Never ban this address or range, and lift its current bans. |
 | `ostrakon disallow <ip\|cidr>` | Remove an entry added with `allow`. |
 | `ostrakon run [--dry-run]` | Run the daemon in the foreground (the service runs this). With `--dry-run` it logs the bans it would make without applying them. |
 
-Every decision is logged with its probability and token usage: `journalctl -u ostrakon`.
+Every decision is logged with its probability and token usage: `journalctl -u ostrakon`. Lines carry journald priorities, so `journalctl -u ostrakon -p warning` shows only the problems.
+
+`ostrakon status` looks like this:
+
+```
+status:  running
+mode:    normal
+sources: sshd(/var/log/auth.log), nginx-access(/var/log/nginx/access.log)
+bans:    3
+last:    2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h
+jev:     2026-10-18T20:00:05Z ok
+```
+
+- `status:` is `running`, `paused (reason: ..., since ...)` or `degraded (...)`, which means the last 5 or more decisions in a row failed without pausing protection. Both are explained under [When Jev is unavailable](#when-jev-is-unavailable).
+- `last:` is the latest decision and what came of it: `ban 1h`, `ban 1h failed: <error>`, `no ban`, `would ban 1h` (dry run) or `skipped (allowlisted)`.
+- `jev:` is the time and outcome of the latest Jev decision request, `ok` or `error: ...`.
+- A `firewall:` line appears only while there is a firewall problem (a ban that failed, a table that could not be checked or rebuilt) and shows the latest error.
 
 ## Jev costs
 
@@ -53,8 +78,10 @@ Every Jev call is billed to your TypeSafe account at TypeSafe's prices. Ostrakon
 Ostrakon has no fallback rules. It pauses protection at once if Jev rejects the key (or there is none), and after about a minute of failed attempts if Jev cannot be reached (network errors, 429, 5xx). While paused:
 
 - It makes no new bans. Existing bans stay and expire on schedule.
-- `ostrakon status` shows `paused` with the reason and the time it started, and the pause is logged as an error.
+- `ostrakon status` shows `paused` with the reason and the time it started, and the pause is logged as an error (`journalctl -u ostrakon -p err`).
 - It keeps reading the logs and checks Jev again after 1 minute, then 2, 4 and every 5 minutes. As soon as Jev answers, protection resumes by itself.
+
+Requests Jev rejects as malformed (400, 413, 415, 422) and answers Ostrakon cannot use do not pause protection, since one odd log line must not switch it off. That decision is dropped and the address is not asked about again for 5 minutes. After 5 failed decisions in a row the error is logged and `ostrakon status` shows `degraded` with it, until a decision succeeds.
 
 ## Known limitations
 
