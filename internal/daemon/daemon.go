@@ -234,14 +234,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 // restoreBans puts the unexpired bans from the state file back into the
 // firewall (its sets are empty after a reboot, or after the table was
-// rebuilt) with their remaining time. It returns the first error, having
-// tried every ban.
+// rebuilt) with their remaining time, but never more than the ban's own
+// length: a clock far behind at boot must not make a 1h ban last for years.
+// It returns the first error, having tried every ban.
 func (d *Daemon) restoreBans(ctx context.Context) error {
 	now := d.deps.Now()
 	restored := 0
 	var first error
 	for _, b := range d.deps.Store.ActiveBans(now) {
-		left := b.Until.Sub(now)
+		left := min(b.Until.Sub(now), b.Until.Sub(b.Since))
 		if left < minRestoreTTL {
 			continue
 		}

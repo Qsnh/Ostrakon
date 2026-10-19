@@ -52,7 +52,7 @@ type Env struct {
 func Unit() string {
 	return `[Unit]
 Description=Ostrakon brute-force protection
-After=network-online.target nftables.service
+After=network-online.target nftables.service time-sync.target
 Wants=network-online.target
 
 [Service]

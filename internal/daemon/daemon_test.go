@@ -494,6 +494,25 @@ func TestRestoreBans(t *testing.T) {
 	}
 }
 
+// A clock that is far behind at boot (before time sync) must not turn a
+// stored 1h ban into one that lasts for years: a restored ban never lasts
+// longer than it was given.
+func TestRestoreBansClockBehind(t *testing.T) {
+	h := newHarness(t)
+	real := time.Now()
+	if err := h.store.AddBan(state.Ban{IP: netip.MustParseAddr("203.0.113.42"), Since: real.Add(-10 * time.Minute),
+		Until: real.Add(50 * time.Minute), Category: "ssh_bruteforce"}); err != nil {
+		t.Fatal(err)
+	}
+	clock := &fakeClock{t: real.AddDate(-1, 0, 0)}
+	h.deps.Now = clock.now
+	h.start()
+	h.barrier()
+	if ttl, ok := h.banned("203.0.113.42"); !ok || ttl != time.Hour {
+		t.Errorf("restored ttl = %v (present %v), want 1h: the ban's own length", ttl, ok)
+	}
+}
+
 func TestEnsureFailureIsFatal(t *testing.T) {
 	h := newHarness(t)
 	h.fw.Err = errors.New("nft: Operation not permitted")
