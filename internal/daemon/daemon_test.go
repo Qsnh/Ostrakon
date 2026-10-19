@@ -17,14 +17,14 @@ import (
 	"testing"
 	"time"
 
-	"ostrakon/internal/allowlist"
-	"ostrakon/internal/event"
-	"ostrakon/internal/firewall"
-	"ostrakon/internal/health"
-	"ostrakon/internal/jev"
-	"ostrakon/internal/judge"
-	"ostrakon/internal/source"
-	"ostrakon/internal/state"
+	"github.com/Qsnh/Ostrakon/internal/allowlist"
+	"github.com/Qsnh/Ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/firewall"
+	"github.com/Qsnh/Ostrakon/internal/health"
+	"github.com/Qsnh/Ostrakon/internal/jev"
+	"github.com/Qsnh/Ostrakon/internal/judge"
+	"github.com/Qsnh/Ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/state"
 )
 
 var sshdFile = source.Spec{Name: source.NameSSHD, Path: "/var/log/auth.log"}

@@ -12,8 +12,8 @@ import (
 	"time"
 	"unicode"
 
-	"ostrakon/internal/event"
-	"ostrakon/internal/jev"
+	"github.com/Qsnh/Ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/jev"
 )
 
 const (

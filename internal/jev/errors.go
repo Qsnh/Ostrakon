@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"ostrakon/internal/apikey"
+	"github.com/Qsnh/Ostrakon/internal/apikey"
 )
 
 // APIError is a non-2xx response from Jev.

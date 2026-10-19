@@ -3,9 +3,9 @@ package daemon
 import (
 	"time"
 
-	"ostrakon/internal/event"
-	"ostrakon/internal/extract"
-	"ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/extract"
+	"github.com/Qsnh/Ostrakon/internal/source"
 )
 
 // parse turns one line from spec into an event stamped with now, using the

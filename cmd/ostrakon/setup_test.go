@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"ostrakon/internal/setup"
-	"ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/setup"
+	"github.com/Qsnh/Ostrakon/internal/source"
 )
 
 // noopSetupEnv is a setup.Env that succeeds without touching the machine.

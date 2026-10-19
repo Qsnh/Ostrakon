@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"ostrakon/internal/apikey"
-	"ostrakon/internal/jev"
-	"ostrakon/internal/judge"
-	"ostrakon/internal/logging"
+	"github.com/Qsnh/Ostrakon/internal/apikey"
+	"github.com/Qsnh/Ostrakon/internal/jev"
+	"github.com/Qsnh/Ostrakon/internal/judge"
+	"github.com/Qsnh/Ostrakon/internal/logging"
 )
 
 // fakeClock is a manually advanced clock, safe for concurrent use.

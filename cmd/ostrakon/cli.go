@@ -12,9 +12,9 @@ import (
 	"time"
 	"unicode"
 
-	"ostrakon/internal/control"
-	"ostrakon/internal/daemon"
-	"ostrakon/internal/state"
+	"github.com/Qsnh/Ostrakon/internal/control"
+	"github.com/Qsnh/Ostrakon/internal/daemon"
+	"github.com/Qsnh/Ostrakon/internal/state"
 )
 
 // Exit codes. exitNotRunning follows systemctl's convention for "status of

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"ostrakon/internal/apikey"
+	"github.com/Qsnh/Ostrakon/internal/apikey"
 )
 
 const okBody = `{"model":"jev-1.13.0","answers":{"is_attack":{"type":"noul","noul":0.93},"ban_duration":{"type":"choice","choice":"1h","probabilities":{"1h":0.7,"none":0.3},"confidence":0.7}},"usage":{"input_tokens":1834,"output_tokens":0}}`

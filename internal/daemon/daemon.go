@@ -15,15 +15,15 @@ import (
 	"sync"
 	"time"
 
-	"ostrakon/internal/allowlist"
-	"ostrakon/internal/event"
-	"ostrakon/internal/firewall"
-	"ostrakon/internal/health"
-	"ostrakon/internal/judge"
-	"ostrakon/internal/netutil"
-	"ostrakon/internal/source"
-	"ostrakon/internal/state"
-	"ostrakon/internal/tracker"
+	"github.com/Qsnh/Ostrakon/internal/allowlist"
+	"github.com/Qsnh/Ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/firewall"
+	"github.com/Qsnh/Ostrakon/internal/health"
+	"github.com/Qsnh/Ostrakon/internal/judge"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/state"
+	"github.com/Qsnh/Ostrakon/internal/tracker"
 )
 
 const (

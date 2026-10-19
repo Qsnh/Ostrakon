@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"ostrakon/internal/jev"
-	"ostrakon/internal/logging"
-	"ostrakon/internal/notify"
+	"github.com/Qsnh/Ostrakon/internal/jev"
+	"github.com/Qsnh/Ostrakon/internal/logging"
+	"github.com/Qsnh/Ostrakon/internal/notify"
 )
 
 // FailureBudget is how long a streak of retryable failures may last, measured

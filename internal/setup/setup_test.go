@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/source"
 )
 
 const wantUnit = `[Unit]

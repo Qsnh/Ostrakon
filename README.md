@@ -18,9 +18,11 @@ Unlike fail2ban there are no jails, filters, regexes or thresholds to configure.
 
 You need a Linux server with systemd and nftables (the `nft` command), root access, and a TypeSafe Jev API key. There is no binary release yet, so you build Ostrakon from source, on any machine with Go 1.25.
 
-1. Build the binary from a checkout of this repository (see [Building](#building) for other architectures):
+1. Build the binary from a checkout of this repository (see [Building](#building) for other architectures, and for `go install`):
 
    ```sh
+   git clone https://github.com/Qsnh/Ostrakon.git
+   cd Ostrakon
    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ostrakon ./cmd/ostrakon
    ```
 
@@ -101,5 +103,13 @@ GOOS=linux CGO_ENABLED=0 go build -o ostrakon ./cmd/ostrakon
 ```
 
 Set `GOARCH` to build for another architecture (for example `GOARCH=arm64`).
+
+Without a checkout, `go install` fetches and builds the latest version:
+
+```sh
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go install github.com/Qsnh/Ostrakon/cmd/ostrakon@latest
+```
+
+The binary is written to `$(go env GOPATH)/bin/linux_amd64/ostrakon` (`GOBIN` must be unset: Go does not install cross-compiled binaries into it). On a Linux machine of the target architecture you can leave out `GOOS` and `GOARCH`; the binary then goes to `$(go env GOPATH)/bin/ostrakon` (or to `GOBIN`).
 
 Tests: `go test ./...` runs everywhere. `bash test/e2e/e2e.sh` runs the end-to-end suite against real nftables in a privileged Docker container; it needs Docker and takes a few minutes.

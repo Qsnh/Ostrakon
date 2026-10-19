@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/event"
 )
 
 // ParseNginxAccess parses one line of an nginx access log in the default

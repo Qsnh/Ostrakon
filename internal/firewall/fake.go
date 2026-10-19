@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
 )
 
 // Fake is an in-memory Firewall for other packages' tests. Tests read Banned

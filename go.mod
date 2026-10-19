@@ -1,4 +1,4 @@
-module ostrakon
+module github.com/Qsnh/Ostrakon
 
 go 1.25.0
 

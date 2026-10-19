@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"os"
 
-	"ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
 )
 
 // UTMPPath is where glibc keeps the table of current login sessions.

@@ -21,9 +21,9 @@ import (
 	"syscall"
 	"time"
 
-	"ostrakon/internal/daemon"
-	"ostrakon/internal/netutil"
-	"ostrakon/internal/state"
+	"github.com/Qsnh/Ostrakon/internal/daemon"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/state"
 )
 
 // SocketPath is where the daemon listens.

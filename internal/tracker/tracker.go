@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/event"
 )
 
 // Event sources, as set by the extractors.

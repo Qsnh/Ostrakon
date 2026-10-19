@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
 )
 
 // SuccessTTL is how long an address stays exempt after a successful login.

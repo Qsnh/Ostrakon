@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"ostrakon/internal/control"
-	"ostrakon/internal/daemon"
-	"ostrakon/internal/state"
+	"github.com/Qsnh/Ostrakon/internal/control"
+	"github.com/Qsnh/Ostrakon/internal/daemon"
+	"github.com/Qsnh/Ostrakon/internal/state"
 )
 
 var testNow = time.Date(2026, 10, 18, 20, 0, 0, 0, time.UTC)

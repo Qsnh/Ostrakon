@@ -4,7 +4,7 @@ import (
 	"net"
 	"net/netip"
 
-	"ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
 )
 
 // LocalAddrs returns the unicast addresses assigned to this machine's

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"ostrakon/internal/daemon"
-	"ostrakon/internal/state"
+	"github.com/Qsnh/Ostrakon/internal/daemon"
+	"github.com/Qsnh/Ostrakon/internal/state"
 )
 
 // fakeBackend records what the server asked of it. The mutex is needed

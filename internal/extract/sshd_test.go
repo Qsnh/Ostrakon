@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/event"
 )
 
 func TestParseSSHD(t *testing.T) {

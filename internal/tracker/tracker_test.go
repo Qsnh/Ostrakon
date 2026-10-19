@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
-	"ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/event"
 )
 
 var (

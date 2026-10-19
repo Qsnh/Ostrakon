@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"ostrakon/internal/control"
+	"github.com/Qsnh/Ostrakon/internal/control"
 )
 
 func main() {

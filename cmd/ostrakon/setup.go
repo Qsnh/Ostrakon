@@ -14,11 +14,11 @@ import (
 
 	"golang.org/x/term"
 
-	"ostrakon/internal/firewall"
-	"ostrakon/internal/jev"
-	"ostrakon/internal/judge"
-	"ostrakon/internal/setup"
-	"ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/firewall"
+	"github.com/Qsnh/Ostrakon/internal/jev"
+	"github.com/Qsnh/Ostrakon/internal/judge"
+	"github.com/Qsnh/Ostrakon/internal/setup"
+	"github.com/Qsnh/Ostrakon/internal/source"
 )
 
 // validateTimeout bounds the key check against Jev.

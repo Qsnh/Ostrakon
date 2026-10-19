@@ -14,8 +14,8 @@ import (
 	"strings"
 	"unicode"
 
-	"ostrakon/internal/apikey"
-	"ostrakon/internal/source"
+	"github.com/Qsnh/Ostrakon/internal/apikey"
+	"github.com/Qsnh/Ostrakon/internal/source"
 )
 
 const (

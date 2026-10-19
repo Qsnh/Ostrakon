@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
 )
 
 const (

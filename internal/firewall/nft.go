@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"ostrakon/internal/netutil"
+	"github.com/Qsnh/Ostrakon/internal/netutil"
 )
 
 // Runner executes an nft script (the input of `nft -f -`) as one atomic

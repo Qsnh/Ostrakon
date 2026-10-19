@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"ostrakon/internal/event"
+	"github.com/Qsnh/Ostrakon/internal/event"
 )
 
 // sshdSyslogPrefix matches a syslog (RFC3164 or RFC3339 timestamp) prefix
