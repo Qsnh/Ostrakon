@@ -614,8 +614,63 @@ func TestRefreshKeepsOldListOnError(t *testing.T) {
 	if n := h.d.tracker.Len(); n != 0 {
 		t.Errorf("tracker holds %d IPs, want 0: a failed refresh keeps the old sessions and a later one adds addresses", n)
 	}
-	if logs := h.logs.String(); !strings.Contains(logs, "level=DEBUG") || !strings.Contains(logs, "no such file or directory") {
-		t.Errorf("the refresh error was not logged at Debug:\n%s", logs)
+	// Failing on every tick with the same error is logged once, at Warn.
+	logs := h.logs.String()
+	if n := strings.Count(logs, `level=WARN msg="cannot read login sessions; keeping the previous list" err="open /var/run/utmp: no such file or directory"`); n != 1 {
+		t.Errorf("the refresh error was logged at Warn %d times, want once:\n%s", n, logs)
+	}
+}
+
+// Review probe: a utmp that cannot be read was logged at Debug only, so the
+// administrator never learnt that their sessions were not protected.
+func TestRefreshFailureLoggedOnChange(t *testing.T) {
+	h := newHarness(t)
+	var sessionCalls, localCalls atomic.Int32
+	h.deps.Sessions = func() ([]netip.Addr, error) {
+		switch n := sessionCalls.Add(1); {
+		case n <= 3:
+			return nil, errors.New("open /var/run/utmp: no such file or directory")
+		case n <= 5:
+			return nil, errors.New("read /var/run/utmp: input/output error")
+		default:
+			return []netip.Addr{netip.MustParseAddr("203.0.113.64")}, nil
+		}
+	}
+	h.deps.Local = func() ([]netip.Addr, error) {
+		if localCalls.Add(1) <= 2 {
+			return nil, errors.New("route ip+net: netlinkrib: permission denied")
+		}
+		return nil, nil
+	}
+	h.start(func(d *Daemon) {
+		d.sessionsEvery = 5 * time.Millisecond
+		d.localEvery = 5 * time.Millisecond
+	})
+	waitFor(t, "refreshes past the recovery", func() bool { return sessionCalls.Load() >= 9 && localCalls.Load() >= 5 })
+
+	logs := h.logs.String()
+	for _, c := range []struct {
+		text string
+		n    int
+	}{
+		{`level=WARN msg="cannot read login sessions; keeping the previous list" err="open /var/run/utmp: no such file or directory"`, 1},
+		{`level=WARN msg="cannot read login sessions; keeping the previous list" err="read /var/run/utmp: input/output error"`, 1},
+		{`level=INFO msg="login sessions can be read again"`, 1},
+		{`level=WARN msg="cannot read local addresses; keeping the previous list" err="route ip+net: netlinkrib: permission denied"`, 1},
+		{`level=INFO msg="local addresses can be read again"`, 1},
+	} {
+		if got := strings.Count(logs, c.text); got != c.n {
+			t.Errorf("%s logged %d times, want %d", c.text, got, c.n)
+		}
+	}
+	if t.Failed() {
+		t.Logf("logs:\n%s", logs)
+	}
+	// And the recovered list is in use.
+	h.send(repeat(failLine("203.0.113.64"), 3)...)
+	h.barrier()
+	if n := h.dec.count(); n != 0 {
+		t.Errorf("Decide called %d times for a session address, want 0", n)
 	}
 }
 

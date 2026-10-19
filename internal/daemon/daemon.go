@@ -119,6 +119,10 @@ type Daemon struct {
 	// with a stale list.
 	allowMu sync.Mutex
 
+	// The latest refresh errors ("" after a success). Only Run, before it
+	// starts maintain, and then maintain use them.
+	sessionsErr, localErr string
+
 	// repairMu lets one firewall repair run at a time: a vanished table
 	// makes every concurrent ban fail, and one rebuild is enough.
 	repairMu sync.Mutex
@@ -599,8 +603,8 @@ func (d *Daemon) refreshSessions() {
 		return
 	}
 	addrs, err := d.deps.Sessions()
+	d.sessionsErr = d.noteRefresh("login sessions", d.sessionsErr, err)
 	if err != nil {
-		d.log.Debug("cannot read login sessions; keeping the previous list", "err", err)
 		return
 	}
 	d.deps.Allow.SetSessions(addrs)
@@ -611,11 +615,29 @@ func (d *Daemon) refreshLocal() {
 		return
 	}
 	addrs, err := d.deps.Local()
+	d.localErr = d.noteRefresh("local addresses", d.localErr, err)
 	if err != nil {
-		d.log.Debug("cannot read local addresses; keeping the previous list", "err", err)
 		return
 	}
 	d.deps.Allow.SetLocal(addrs)
+}
+
+// noteRefresh logs the outcome of reading what when it differs from the
+// previous one (prev, the previous error text or ""): a Warn when reading
+// starts failing or fails differently, an Info when it works again; never
+// once per tick. It returns the error text to pass as prev next time.
+func (d *Daemon) noteRefresh(what, prev string, err error) string {
+	if err == nil {
+		if prev != "" {
+			d.log.Info(what + " can be read again")
+		}
+		return ""
+	}
+	if msg := err.Error(); msg != prev {
+		d.log.Warn("cannot read "+what+"; keeping the previous list", "err", err)
+		return msg
+	}
+	return prev
 }
 
 // syncAllow pushes the stored allowlist into Allow.
