@@ -128,10 +128,9 @@ func (m *Monitor) clearStreak() {
 	m.mu.Unlock()
 }
 
-// budgetSpent records one more retryable failure and reports whether the
-// current streak has now lasted FailureBudget or longer.
-func (m *Monitor) budgetSpent() bool {
-	now := m.now()
+// budgetSpent records one more retryable failure, seen at now, and reports
+// whether the shared streak has now lasted FailureBudget or longer.
+func (m *Monitor) budgetSpent(now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.streakStart.IsZero() {
@@ -159,9 +158,16 @@ func (m *Monitor) pauseFor(cause error) error {
 //     A pause makes Call return an error that wraps both ErrPaused and the last
 //     failure. If another caller pauses meanwhile, this Call returns ErrPaused
 //     instead of calling fn again.
+//   - Each Call also has a bound of its own: other workers' successes keep
+//     resetting the shared streak, so a request that alone keeps failing would
+//     otherwise retry forever. Once this Call's own failures span FailureBudget
+//     (and the shared streak did not pause), Call gives up: it returns the last
+//     error, wrapped (errors.As still finds the cause, errors.Is(ErrPaused) is
+//     false), without pausing and without calling fn again.
 //   - If sleep fails (ctx done), Call returns that error.
 func (m *Monitor) Call(ctx context.Context, sleep Sleeper, fn func(ctx context.Context) error) error {
 	backoff := backoffStart
+	var firstFailure time.Time // this Call's first retryable failure
 	for {
 		if m.isPaused() {
 			return ErrPaused
@@ -179,8 +185,16 @@ func (m *Monitor) Call(ctx context.Context, sleep Sleeper, fn func(ctx context.C
 		}
 
 		// Retryable.
-		if m.budgetSpent() {
+		now := m.now()
+		if m.budgetSpent(now) {
 			return m.pauseFor(err)
+		}
+		if firstFailure.IsZero() {
+			firstFailure = now
+		}
+		if now.Sub(firstFailure) >= FailureBudget {
+			return fmt.Errorf("giving up on this request after %v of retries: %w",
+				now.Sub(firstFailure).Round(time.Second), err)
 		}
 		wait := backoff
 		backoff = min(backoff*2, backoffMax)

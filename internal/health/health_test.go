@@ -594,6 +594,57 @@ func TestStreakIsSharedAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestCallGivesUpWithoutPausing(t *testing.T) {
+	// Worker A's request keeps failing with 529 while other workers' requests
+	// succeed, so the shared streak is reset again and again and never reaches
+	// the budget. A must still stop after FailureBudget of its own failures,
+	// without pausing protection and without pinning its worker forever.
+	r := newRig()
+	ctx := context.Background()
+	calls := 0
+	fnA := func(context.Context) error {
+		calls++
+		if calls > 20 { // runaway guard: end the call with a non-Jev error
+			t.Error("fn still being called: Call has no bound of its own")
+			return context.Canceled
+		}
+		return api(529)
+	}
+	otherOK := func(context.Context) error { return nil }
+	r.sl.hook = func(int) {
+		// Another worker succeeds during A's backoff.
+		if err := r.m.Call(ctx, r.sl.sleep, otherOK); err != nil {
+			t.Errorf("other worker: Call = %v", err)
+		}
+	}
+
+	err := r.m.Call(ctx, r.sl.sleep, fnA)
+	if err == nil {
+		t.Fatal("Call = nil, want the last error")
+	}
+	if errors.Is(err, ErrPaused) {
+		t.Errorf("Call = %v; giving up must not be reported as ErrPaused", err)
+	}
+	var apiErr *jev.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 529 {
+		t.Errorf("cause not preserved: errors.As = %v, %+v", errors.As(err, &apiErr), apiErr)
+	}
+	s := time.Second
+	want := []time.Duration{1 * s, 2 * s, 4 * s, 8 * s, 16 * s, 16 * s, 16 * s}
+	if got := r.sl.sleeps(); !sleepsEqual(got, want) {
+		t.Errorf("sleeps = %v, want %v", got, want)
+	}
+	if calls != len(want)+1 {
+		t.Errorf("fn calls = %d, want %d (no call after giving up)", calls, len(want)+1)
+	}
+	if p, _, _ := r.m.Paused(); p {
+		t.Error("monitor paused although the shared streak never reached the budget")
+	}
+	if p, _ := r.nt.counts(); p != 0 {
+		t.Errorf("Paused notifications = %d, want 0", p)
+	}
+}
+
 func TestBackoffIsPerCall(t *testing.T) {
 	// A second Call starts again at 1s, even though the first ended mid-backoff.
 	r := newRig()
