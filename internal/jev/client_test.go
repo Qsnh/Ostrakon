@@ -105,7 +105,7 @@ func TestSystemOneSendsRequest(t *testing.T) {
 	if resp.Model != "jev-1.13.0" {
 		t.Errorf("resp.Model = %q", resp.Model)
 	}
-	if got := resp.Answers["is_attack"].Noul; got != 0.93 {
+	if got := resp.Answers["is_attack"].Noul; got == nil || *got != 0.93 {
 		t.Errorf("is_attack noul = %v, want 0.93", got)
 	}
 	bd := resp.Answers["ban_duration"]

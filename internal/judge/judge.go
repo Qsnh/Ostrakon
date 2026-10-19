@@ -219,7 +219,10 @@ func (j *Judge) Decide(ctx context.Context, ip netip.Addr, events []event.Event,
 	if !ok {
 		return Decision{}, fmt.Errorf("%w: no %s answer", ErrMalformedAnswer, qIsAttack)
 	}
-	prob := attack.Noul
+	if attack.Noul == nil {
+		return Decision{}, fmt.Errorf("%w: %s has no noul value", ErrMalformedAnswer, qIsAttack)
+	}
+	prob := *attack.Noul
 	if !(prob >= 0 && prob <= 1) { // also rejects NaN
 		return Decision{}, fmt.Errorf("%w: %s = %v is not a probability", ErrMalformedAnswer, qIsAttack, prob)
 	}

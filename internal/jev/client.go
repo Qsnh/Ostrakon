@@ -44,9 +44,10 @@ type Request struct {
 }
 
 // Answer is Jev's answer to one question; which fields are set depends on Type.
+// Noul is nil when the answer carries no noul value (absent or null).
 type Answer struct {
 	Type          string             `json:"type"`
-	Noul          float64            `json:"noul"`
+	Noul          *float64           `json:"noul"`
 	Choice        string             `json:"choice"`
 	Score         float64            `json:"score"`
 	Probabilities map[string]float64 `json:"probabilities"`

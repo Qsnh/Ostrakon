@@ -287,13 +287,15 @@ func answers(attack float64, category, duration string, inputTokens int) jev.Res
 	return jev.Response{
 		Model: jev.Model,
 		Answers: map[string]jev.Answer{
-			"is_attack":    {Type: "noul", Noul: attack},
+			"is_attack":    {Type: "noul", Noul: &attack},
 			"category":     {Type: "choice", Choice: category},
 			"ban_duration": {Type: "choice", Choice: duration},
 		},
 		Usage: jev.Usage{InputTokens: inputTokens},
 	}
 }
+
+func ptr(f float64) *float64 { return &f }
 
 func decide(t *testing.T, j *Judge) (Decision, error) {
 	t.Helper()
@@ -413,8 +415,9 @@ func TestDecideMalformed(t *testing.T) {
 		"forever":              func(r *jev.Response) { r.Answers["ban_duration"] = jev.Answer{Type: "choice", Choice: "forever"} },
 		"empty choice":         func(r *jev.Response) { r.Answers["ban_duration"] = jev.Answer{Type: "choice"} },
 		"missing is_attack":    func(r *jev.Response) { delete(r.Answers, "is_attack") },
-		"is_attack above 1":    func(r *jev.Response) { r.Answers["is_attack"] = jev.Answer{Type: "noul", Noul: 1.5} },
-		"is_attack negative":   func(r *jev.Response) { r.Answers["is_attack"] = jev.Answer{Type: "noul", Noul: -0.1} },
+		"is_attack above 1":    func(r *jev.Response) { r.Answers["is_attack"] = jev.Answer{Type: "noul", Noul: ptr(1.5)} },
+		"is_attack negative":   func(r *jev.Response) { r.Answers["is_attack"] = jev.Answer{Type: "noul", Noul: ptr(-0.1)} },
+		"is_attack no noul":    func(r *jev.Response) { r.Answers["is_attack"] = jev.Answer{Type: "noul"} },
 		"no answers":           func(r *jev.Response) { r.Answers = nil },
 	}
 	for name, mutate := range cases {
@@ -431,6 +434,33 @@ func TestDecideMalformed(t *testing.T) {
 			}
 			if c := jev.Classify(err); c != jev.ClassBadRequest {
 				t.Errorf("Classify = %v, want ClassBadRequest", c)
+			}
+		})
+	}
+}
+
+// An is_attack answer that carries no noul value is malformed, not a zero
+// probability: the decoded wire answers are what Decide sees.
+func TestDecideMissingNoul(t *testing.T) {
+	for name, attack := range map[string]string{
+		"absent": `{"type":"noul"}`,
+		"null":   `{"type":"noul","noul":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := `{"model":"jev-1.13.0","answers":{"is_attack":` + attack + `,` +
+				`"category":{"type":"choice","choice":"benign"},` +
+				`"ban_duration":{"type":"choice","choice":"none"}},"usage":{"input_tokens":5}}`
+			var resp jev.Response
+			if err := json.Unmarshal([]byte(body), &resp); err != nil {
+				t.Fatal(err)
+			}
+			j := &Judge{Client: &fakeClient{resp: resp}, Threshold: DefaultThreshold}
+			got, err := decide(t, j)
+			if !errors.Is(err, ErrMalformedAnswer) {
+				t.Fatalf("Decide = %+v, %v; want ErrMalformedAnswer", got, err)
+			}
+			if jev.Classify(err) != jev.ClassBadRequest {
+				t.Errorf("Classify = %v, want ClassBadRequest", jev.Classify(err))
 			}
 		})
 	}
