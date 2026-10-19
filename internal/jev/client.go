@@ -92,8 +92,10 @@ func New(baseURL string, key func() (string, error)) *Client {
 // Errors, for Classify: a failing Key (such as apikey.ErrNoKey) is returned
 // wrapped without sending anything; a non-2xx status is an *APIError; if ctx
 // ends the error wraps ctx.Err(); other transport failures, including the
-// client's own timeout while ctx is alive, are retryable; a 2xx body that is
-// not valid JSON is a plain error.
+// client's own timeout while ctx is alive, are retryable; so is a 2xx body
+// that cannot be decoded at all (a proxy's HTML page, an empty body), since
+// persistent garbage from the endpoint means Jev is unusable. A body that
+// decodes but holds odd answers is returned as is for the caller to judge.
 func (c *Client) SystemOne(ctx context.Context, req Request) (Response, error) {
 	key, err := c.Key()
 	if err != nil {
@@ -137,7 +139,7 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (Response, error) {
 	}
 	var out Response
 	if err := json.Unmarshal(data, &out); err != nil {
-		return Response{}, fmt.Errorf("jev: decode response: %w", err)
+		return Response{}, &transportError{err: fmt.Errorf("decode response: %w", err)}
 	}
 	return out, nil
 }

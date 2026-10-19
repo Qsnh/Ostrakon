@@ -365,18 +365,52 @@ func TestTruncatedSuccessBodyIsRetryable(t *testing.T) {
 	}
 }
 
-func TestUndecodableSuccessBodyIsBadRequest(t *testing.T) {
+func TestUndecodableSuccessBodyIsRetryable(t *testing.T) {
+	// Persistent garbage from the endpoint means Jev is unusable, which must
+	// lead to a visible pause rather than silently dropped decisions.
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"html page", "<html>oops</html>"},
+		{"empty", ""},
+		{"wrong shape", `{"answers":"nope"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			_, err := New(srv.URL, staticKey("k")).SystemOne(context.Background(), sampleRequest())
+			if err == nil {
+				t.Fatal("SystemOne succeeded on an undecodable body")
+			}
+			if got := Classify(err); got != ClassRetryable {
+				t.Errorf("Classify = %d, want ClassRetryable (err: %v)", got, err)
+			}
+		})
+	}
+}
+
+func TestOddButDecodableAnswersAreReturned(t *testing.T) {
+	// Valid JSON with missing or unexpected answers is the judge's problem
+	// (judge.ErrMalformedAnswer), not a client error.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, "<html>not json</html>")
+		_, _ = io.WriteString(w, `{"model":"jev-1.13.0","answers":{"ban_duration":{"type":"choice","choice":"forever"}}}`)
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL, staticKey("k")).SystemOne(context.Background(), sampleRequest())
-	if err == nil {
-		t.Fatal("SystemOne succeeded on a non-JSON body")
+	resp, err := New(srv.URL, staticKey("k")).SystemOne(context.Background(), sampleRequest())
+	if err != nil {
+		t.Fatalf("SystemOne: %v", err)
 	}
-	if got := Classify(err); got != ClassBadRequest {
-		t.Errorf("Classify = %d, want ClassBadRequest (err: %v)", got, err)
+	if got := resp.Answers["ban_duration"].Choice; got != "forever" {
+		t.Errorf("choice = %q, want %q passed through untouched", got, "forever")
+	}
+	if _, ok := resp.Answers["is_attack"]; ok {
+		t.Error("is_attack answer appeared out of nowhere")
 	}
 }
 
