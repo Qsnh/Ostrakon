@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -786,5 +787,93 @@ func TestParse(t *testing.T) {
 				t.Errorf("event = %+v, want kind %s from 203.0.113.7 at %v", ev, tt.kind, now)
 			}
 		})
+	}
+}
+
+// Requests Jev keeps rejecting (422) do not pause protection, but they must
+// not go unnoticed either, nor be re-asked for every new line.
+func TestNonPausingFailuresDegradeAndBackOff(t *testing.T) {
+	h := newHarness(t)
+	h.dec.setAnswer(answerWith(judge.Decision{}, &jev.APIError{Status: 422, Body: "bad state"}))
+	h.start()
+	ips := []string{"203.0.113.101", "203.0.113.102", "203.0.113.103", "203.0.113.104", "203.0.113.105"}
+	for i, ip := range ips {
+		h.send(repeat(failLine(ip), 3)...)
+		waitFor(t, "a failed decision for "+ip, func() bool { return h.d.Status().JevFailures == i+1 })
+		if st := h.d.Status(); i < 4 && st.Degraded != "" {
+			t.Fatalf("degraded after %d failures: %q", i+1, st.Degraded)
+		}
+	}
+	st := h.d.Status()
+	if !strings.Contains(st.Degraded, "5 consecutive Jev request failures") || !strings.Contains(st.Degraded, "HTTP 422") {
+		t.Errorf("Status().Degraded = %q, want it to count 5 failures and name the error", st.Degraded)
+	}
+	if st.Paused {
+		t.Error("a rejected request paused protection")
+	}
+	if !strings.HasSuffix(st.LastJev, " error: jev: HTTP 422: bad state") {
+		t.Errorf("Status().LastJev = %q, want the 422 error", st.LastJev)
+	}
+	if _, err := time.Parse(time.RFC3339, strings.Fields(st.LastJev)[0]); err != nil {
+		t.Errorf("LastJev does not start with an RFC3339 time: %q", st.LastJev)
+	}
+	errLog := `level=ERROR msg="jev requests failing" count=5`
+	if n := strings.Count(h.logs.String(), errLog); n != 1 {
+		t.Errorf("%q logged %d times, want once:\n%s", errLog, n, h.logs.String())
+	}
+	data, _ := json.Marshal(st)
+	for _, key := range []string{`"last_jev":`, `"jev_failures":5`, `"degraded":`} {
+		if !strings.Contains(string(data), key) {
+			t.Errorf("status JSON lacks %s: %s", key, data)
+		}
+	}
+
+	// The same address keeps failing to log in: backed off, Jev is not asked.
+	h.send(repeat(failLine(ips[0]), 10)...)
+	h.barrier()
+	settle()
+	if n := h.dec.countFor(ips[0]); n != 1 {
+		t.Errorf("Decide called %d times for %s within the backoff, want 1", n, ips[0])
+	}
+
+	// A sixth failure is counted but not logged at Error again.
+	h.send(repeat(failLine("203.0.113.106"), 3)...)
+	waitFor(t, "the sixth failure", func() bool { return h.d.Status().JevFailures == 6 })
+	if n := strings.Count(h.logs.String(), `msg="jev requests failing"`); n != 1 {
+		t.Errorf(`"jev requests failing" logged %d times after 6 failures, want once`, n)
+	}
+
+	// A success clears it.
+	h.dec.setAnswer(answerWith(benignDecision, nil))
+	h.send(repeat(failLine("203.0.113.107"), 3)...)
+	waitFor(t, "a success to clear the degraded state", func() bool {
+		st := h.d.Status()
+		return st.Degraded == "" && st.JevFailures == 0
+	})
+	if got := h.d.Status().LastJev; !strings.HasSuffix(got, " ok") {
+		t.Errorf("Status().LastJev = %q after a success, want it to end in ok", got)
+	}
+}
+
+// Review probe: malformed 200 answers made every further line from the same
+// attacker a new billed Jev call.
+func TestMalformedAnswerNotReaskedPerLine(t *testing.T) {
+	h := newHarness(t)
+	h.dec.setAnswer(answerWith(judge.Decision{}, fmt.Errorf("%w: is_attack has no noul value", judge.ErrMalformedAnswer)))
+	h.start()
+	const ip = "203.0.113.120"
+	h.send(repeat(failLine(ip), 3)...)
+	waitFor(t, "the first decision to fail", func() bool { return strings.Contains(h.logs.String(), `msg="no decision`) })
+	for range 20 {
+		h.send(failLine(ip))
+		time.Sleep(2 * time.Millisecond) // let a (wrongly) queued decision run
+	}
+	h.barrier()
+	settle()
+	if n := h.dec.count(); n != 1 {
+		t.Errorf("Decide called %d times for 23 lines from one address, want 1", n)
+	}
+	if st := h.d.Status(); st.JevFailures != 1 || st.Degraded != "" {
+		t.Errorf("Status() = %+v, want 1 failure and not degraded", st)
 	}
 }

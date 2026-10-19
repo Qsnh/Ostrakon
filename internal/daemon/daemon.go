@@ -35,6 +35,13 @@ const (
 	lineBuffer = 256
 	// minRestoreTTL: a stored ban with less time left is not restored.
 	minRestoreTTL = time.Second
+	// degradedAfter is how many decisions in a row may fail without pausing
+	// (rejected requests, unusable answers) before Status reports degraded.
+	degradedAfter = 5
+	// failureBackoff is how long an address whose decision failed waits
+	// before it may trigger another one, so that a request Jev keeps
+	// rejecting is not re-sent (and billed) for every new log line.
+	failureBackoff = 5 * time.Minute
 
 	sessionsRefresh      = 30 * time.Second
 	localRefresh         = 5 * time.Minute
@@ -76,6 +83,14 @@ type Status struct {
 	Sources      []string  `json:"sources"` // e.g. "sshd(/var/log/auth.log)", "sshd(journald)"
 	BanCount     int       `json:"ban_count"`
 	LastDecision string    `json:"last_decision,omitempty"` // e.g. "2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h"
+	// LastJev is the outcome of the latest Jev decision request, e.g.
+	// "2026-10-18T20:00:05Z ok" or "2026-10-18T20:00:05Z error: jev: HTTP 422".
+	LastJev string `json:"last_jev,omitempty"`
+	// JevFailures counts the decisions in a row that failed without pausing
+	// (rejected requests, unusable answers, requests that kept failing).
+	JevFailures int `json:"jev_failures,omitempty"`
+	// Degraded is set once JevFailures reaches 5, until a decision succeeds.
+	Degraded string `json:"degraded,omitempty"`
 }
 
 // Daemon is the running pipeline. Status, Bans, Unban, Allow and Disallow
@@ -103,6 +118,9 @@ type Daemon struct {
 	mu           sync.Mutex
 	probing      bool // a prober goroutine is running
 	lastDecision string
+	lastJev      string
+	jevFailures  int    // decisions in a row that failed without pausing
+	degraded     string // set once jevFailures reaches degradedAfter
 }
 
 // New returns a Daemon for d. Nothing runs until Run.
@@ -267,25 +285,34 @@ func (d *Daemon) decide(ctx context.Context, b tracker.Batch) {
 	err := d.deps.Monitor.Call(ctx, d.deps.Sleep, func(ctx context.Context) error {
 		var err error
 		dec, err = d.deps.Decider.Decide(ctx, ip, b.Events, hist)
+		if ctx.Err() == nil {
+			d.noteJevCall(err)
+		}
 		return err
 	})
 	if err != nil {
-		d.tracker.Done(ip, false)
 		switch {
 		case errors.Is(err, health.ErrPaused):
 			// The monitor has logged the pause; make sure something
 			// probes for the end of it.
+			d.tracker.Done(ip, false)
 			d.log.Debug("no decision: protection is paused", "ip", ip)
 			d.ensureProber(ctx)
 		case ctx.Err() != nil:
 			// Shutting down.
+			d.tracker.Done(ip, false)
 		default:
 			// A bad request, an unusable answer, or a request that kept
-			// failing on its own: drop it; the IP can trigger again.
-			d.log.Warn("no decision", "ip", ip, "err", err)
+			// failing on its own: drop it, and leave the IP alone for a
+			// while rather than asking again on its next line.
+			d.log.Warn("no decision; not asking about this address again for a while",
+				"ip", ip, "for", failureBackoff, "err", err)
+			d.tracker.Backoff(ip, failureBackoff)
+			d.noteJevFailure(err)
 		}
 		return
 	}
+	d.noteJevSuccess()
 
 	d.recordDecision(ip, dec)
 	switch {
@@ -341,6 +368,44 @@ func (d *Daemon) recordDecision(ip netip.Addr, dec judge.Decision) {
 	d.mu.Lock()
 	d.lastDecision = s
 	d.mu.Unlock()
+}
+
+// noteJevCall makes the outcome of one Jev request Status().LastJev.
+func (d *Daemon) noteJevCall(err error) {
+	s := d.deps.Now().UTC().Format(time.RFC3339) + " ok"
+	if err != nil {
+		s = strings.TrimSuffix(s, "ok") + "error: " + err.Error()
+	}
+	d.mu.Lock()
+	d.lastJev = s
+	d.mu.Unlock()
+}
+
+// noteJevFailure counts a decision that failed without pausing. The
+// degradedAfter-th failure in a row is logged as an error and makes Status
+// report degraded until a decision succeeds.
+func (d *Daemon) noteJevFailure(err error) {
+	d.mu.Lock()
+	d.jevFailures++
+	n := d.jevFailures
+	if n >= degradedAfter {
+		d.degraded = fmt.Sprintf("%d consecutive Jev request failures: %v", n, err)
+	}
+	d.mu.Unlock()
+	if n == degradedAfter {
+		d.log.Error("jev requests failing", "count", n, "err", err)
+	}
+}
+
+// noteJevSuccess ends a run of failed decisions.
+func (d *Daemon) noteJevSuccess() {
+	d.mu.Lock()
+	was := d.degraded != ""
+	d.jevFailures, d.degraded = 0, ""
+	d.mu.Unlock()
+	if was {
+		d.log.Info("jev requests succeed again")
+	}
 }
 
 // shortDuration formats d without zero trailing units: 1h, 10m, 168h, 1h30m.
@@ -468,18 +533,21 @@ func (d *Daemon) syncAllow() {
 // Status reports the daemon's current state.
 func (d *Daemon) Status() Status {
 	paused, reason, since := d.deps.Monitor.Paused()
-	d.mu.Lock()
-	last := d.lastDecision
-	d.mu.Unlock()
-	return Status{
-		Paused:       paused,
-		PauseReason:  reason,
-		PausedSince:  since,
-		DryRun:       d.deps.DryRun,
-		Sources:      append([]string{}, d.sources...),
-		BanCount:     len(d.deps.Store.ActiveBans(d.deps.Now())),
-		LastDecision: last,
+	st := Status{
+		Paused:      paused,
+		PauseReason: reason,
+		PausedSince: since,
+		DryRun:      d.deps.DryRun,
+		Sources:     append([]string{}, d.sources...),
+		BanCount:    len(d.deps.Store.ActiveBans(d.deps.Now())),
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st.LastDecision = d.lastDecision
+	st.LastJev = d.lastJev
+	st.JevFailures = d.jevFailures
+	st.Degraded = d.degraded
+	return st
 }
 
 // Bans returns the active bans, soonest-expiring first.

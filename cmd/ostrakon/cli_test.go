@@ -61,6 +61,7 @@ func TestCLIStatusRunning(t *testing.T) {
 		Sources:      []string{"sshd(/var/log/auth.log)", "nginx-access(/var/log/nginx/access.log)"},
 		BanCount:     3,
 		LastDecision: "2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h",
+		LastJev:      "2026-10-18T20:00:05Z ok",
 	}), nil)
 	if code != 0 || stderr != "" {
 		t.Errorf("code = %d, stderr = %q", code, stderr)
@@ -69,7 +70,8 @@ func TestCLIStatusRunning(t *testing.T) {
 		"mode:    normal\n" +
 		"sources: sshd(/var/log/auth.log), nginx-access(/var/log/nginx/access.log)\n" +
 		"bans:    3\n" +
-		"last:    2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h\n"
+		"last:    2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h\n" +
+		"jev:     2026-10-18T20:00:05Z ok\n"
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
 	}
@@ -84,7 +86,8 @@ func TestCLIStatusDryRunAndNothingYet(t *testing.T) {
 		"mode:    dry-run\n" +
 		"sources: -\n" +
 		"bans:    0\n" +
-		"last:    -\n"
+		"last:    -\n" +
+		"jev:     -\n"
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
 	}
@@ -119,8 +122,52 @@ func TestCLIStatusPauseReasonIsOneLine(t *testing.T) {
 	if strings.Contains(stdout, "\x1b") {
 		t.Errorf("a control character reached the terminal: %q", stdout)
 	}
-	if lines := strings.Count(stdout, "\n"); lines != 5 {
-		t.Errorf("status has %d lines, want 5:\n%s", lines, stdout)
+	if lines := strings.Count(stdout, "\n"); lines != 6 {
+		t.Errorf("status has %d lines, want 6:\n%s", lines, stdout)
+	}
+}
+
+func TestCLIStatusDegraded(t *testing.T) {
+	_, stdout, _, _ := cliRun(t, []string{"status"}, true, statusResp(daemon.Status{
+		Degraded:    "5 consecutive Jev request failures: jev: HTTP 422: bad state",
+		JevFailures: 5,
+		LastJev:     "2026-10-18T20:00:05Z error: jev: HTTP 422: bad state",
+	}), nil)
+	for _, want := range []string{
+		"status:  degraded (5 consecutive Jev request failures: jev: HTTP 422: bad state)\n",
+		"jev:     2026-10-18T20:00:05Z error: jev: HTTP 422: bad state\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestCLIStatusPausedOutranksDegraded(t *testing.T) {
+	_, stdout, _, _ := cliRun(t, []string{"status"}, true, statusResp(daemon.Status{
+		Paused:      true,
+		PauseReason: "jev: HTTP 401",
+		PausedSince: testNow,
+		Degraded:    "5 consecutive Jev request failures: x",
+	}), nil)
+	if !strings.HasPrefix(stdout, "status:  paused (reason: jev: HTTP 401, since 2026-10-18T20:00:00Z)\n") {
+		t.Errorf("stdout:\n%s\nwant the pause first", stdout)
+	}
+}
+
+// Text that came from Jev or nft may hold newlines and escapes; each status
+// line stays one line.
+func TestCLIStatusExternalTextIsOneLine(t *testing.T) {
+	_, stdout, _, _ := cliRun(t, []string{"status"}, true, statusResp(daemon.Status{
+		Degraded:     "5 consecutive Jev request failures: a\nb",
+		LastDecision: "2026-10-18T20:00:05Z 203.0.113.7 - p=0.93 ban 1h failed: nft: Error:\n\x1b[2Jx",
+		LastJev:      "2026-10-18T20:00:05Z error: \r\nboom",
+	}), nil)
+	if strings.Contains(stdout, "\x1b") || strings.Contains(stdout, "\r") {
+		t.Errorf("a control character reached the terminal: %q", stdout)
+	}
+	if lines := strings.Count(stdout, "\n"); lines != 6 {
+		t.Errorf("status has %d lines, want 6:\n%s", lines, stdout)
 	}
 }
 

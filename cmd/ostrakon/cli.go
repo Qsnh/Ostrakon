@@ -142,8 +142,11 @@ func oneArgument(cmd string, args []string) (arg, msg string) {
 
 func printStatus(w io.Writer, s daemon.Status) {
 	status := "running"
-	if s.Paused {
+	switch {
+	case s.Paused:
 		status = fmt.Sprintf("paused (reason: %s, since %s)", oneLine(s.PauseReason), s.PausedSince.Format(time.RFC3339))
+	case s.Degraded != "":
+		status = fmt.Sprintf("degraded (%s)", oneLine(s.Degraded))
 	}
 	mode := "normal"
 	if s.DryRun {
@@ -153,17 +156,21 @@ func printStatus(w io.Writer, s daemon.Status) {
 	if len(s.Sources) > 0 {
 		sources = strings.Join(s.Sources, ", ")
 	}
-	last := s.LastDecision
-	if last == "" {
-		last = "-"
+	fmt.Fprintf(w, "status:  %s\nmode:    %s\nsources: %s\nbans:    %d\nlast:    %s\njev:     %s\n",
+		status, mode, sources, s.BanCount, orDash(s.LastDecision), orDash(s.LastJev))
+}
+
+// orDash makes s one line, or "-" when it is empty.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
 	}
-	fmt.Fprintf(w, "status:  %s\nmode:    %s\nsources: %s\nbans:    %d\nlast:    %s\n",
-		status, mode, sources, s.BanCount, last)
+	return oneLine(s)
 }
 
 // oneLine replaces control characters, so that text that came from outside
-// (a pause reason quotes Jev's reply) cannot move the cursor or start a
-// second line in the administrator's terminal.
+// (a pause reason quotes Jev's reply, a failed ban quotes nft) cannot move
+// the cursor or start a second line in the administrator's terminal.
 func oneLine(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {

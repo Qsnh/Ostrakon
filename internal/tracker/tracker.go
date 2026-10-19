@@ -86,6 +86,8 @@ type ipState struct {
 	benign      bool      // a benign verdict is cached
 	benignBase  counts    // the window's tallies when it was cached
 	benignUntil time.Time // last event time at caching + BenignTTL
+
+	backoffUntil time.Time // no trigger before this event time; zero if none
 }
 
 // buffer is one source's events for an IP, sorted ascending by Time and at
@@ -173,6 +175,12 @@ func (t *Tracker) Add(ev event.Event) (Batch, bool) {
 		return Batch{}, false
 	}
 	now := st.newest()
+	if !st.backoffUntil.IsZero() {
+		if now.Before(st.backoffUntil) {
+			return Batch{}, false
+		}
+		st.backoffUntil = time.Time{}
+	}
 	if st.benign && !now.Before(st.benignUntil) {
 		st.benign = false
 	}
@@ -211,6 +219,26 @@ func (t *Tracker) Done(ip netip.Addr, benign bool) {
 	t.dropIfIdle(el)
 }
 
+// Backoff ends the decision started by Add without a verdict, after a failed
+// one: ip does not trigger again until its newest event is at least d later
+// than its newest event now. Events keep being stored meanwhile, and any
+// benign cache is left as it was. With an empty window (nothing to measure
+// from) it is the same as Done(ip, false). Unknown IPs are ignored.
+func (t *Tracker) Backoff(ip netip.Addr, d time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	el, ok := t.ips[ip]
+	if !ok {
+		return
+	}
+	st := el.Value.(*ipState)
+	st.inFlight = false
+	if st.size() > 0 {
+		st.backoffUntil = st.newest().Add(d)
+	}
+	t.dropIfIdle(el)
+}
+
 // Forget discards everything about ip, typically after banning it.
 func (t *Tracker) Forget(ip netip.Addr) {
 	t.mu.Lock()
@@ -220,9 +248,9 @@ func (t *Tracker) Forget(ip netip.Addr) {
 	}
 }
 
-// Prune drops events at least Window older than now and expired benign
-// caches, then forgets every IP left with no events, no decision in flight
-// and no live cache.
+// Prune drops events at least Window older than now, expired benign caches
+// and backoffs, then forgets every IP left with no events, no decision in
+// flight, no live cache and no live backoff.
 func (t *Tracker) Prune(now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -234,6 +262,9 @@ func (t *Tracker) Prune(now time.Time) {
 		t.total += st.size() - before
 		if st.benign && !now.Before(st.benignUntil) {
 			st.benign = false
+		}
+		if !st.backoffUntil.IsZero() && !now.Before(st.backoffUntil) {
+			st.backoffUntil = time.Time{}
 		}
 		t.dropIfIdle(el)
 		el = next
@@ -279,7 +310,7 @@ func (t *Tracker) remove(el *list.Element) {
 
 // dropIfIdle forgets the IP when nothing about it is worth remembering.
 func (t *Tracker) dropIfIdle(el *list.Element) {
-	if st := el.Value.(*ipState); st.size() == 0 && !st.inFlight && !st.benign {
+	if st := el.Value.(*ipState); st.size() == 0 && !st.inFlight && !st.benign && st.backoffUntil.IsZero() {
 		t.remove(el)
 	}
 }

@@ -1001,3 +1001,82 @@ func TestPerIPCapIsPerSource(t *testing.T) {
 	}
 	checkAscending(t, b.Events)
 }
+
+func TestBackoff(t *testing.T) {
+	const d = 5 * time.Minute
+	tr := New(DefaultConfig())
+	mustNotTrigger(t, tr, sshFail(ipA, 0))
+	mustNotTrigger(t, tr, sshFail(ipA, sec(1)))
+	mustTrigger(t, tr, sshFail(ipA, sec(2)))
+	tr.Backoff(ipA, d) // starts at the newest event, 2s
+
+	// No trigger, however many failures, until 2s+5m; they are still stored.
+	for i := 3; i <= 10; i++ {
+		mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
+	}
+	mustNotTrigger(t, tr, sshFail(ipA, sec(2)+d-time.Nanosecond))
+	b := mustTrigger(t, tr, sshFail(ipA, sec(2)+d))
+	if len(b.Events) != 13 {
+		t.Fatalf("len(Events) = %d, want 13 (events seen during the backoff are kept)", len(b.Events))
+	}
+}
+
+func TestBackoffClearsInFlightAndKeepsBenignCache(t *testing.T) {
+	tr := New(DefaultConfig())
+	for i := 0; i < 2; i++ {
+		mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
+	}
+	mustTrigger(t, tr, sshFail(ipA, sec(2)))
+	tr.Done(ipA, true) // benign with N=3
+	for i := 3; i < 5; i++ {
+		mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
+	}
+	mustTrigger(t, tr, sshFail(ipA, sec(5))) // N=6
+	tr.Backoff(ipA, time.Minute)
+	// Past the backoff the benign cache (N=3) still applies: 8 >= 2*3, so the
+	// first event after 5s+1m triggers.
+	mustNotTrigger(t, tr, sshFail(ipA, sec(30)))
+	mustTrigger(t, tr, sshFail(ipA, sec(65)))
+}
+
+func TestBackoffSurvivesPrune(t *testing.T) {
+	tr := New(DefaultConfig())
+	for i := 0; i < 2; i++ {
+		mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
+	}
+	mustTrigger(t, tr, sshFail(ipA, sec(2)))
+	tr.Backoff(ipA, 20*time.Minute) // longer than the window
+	tr.Prune(t0.Add(15 * time.Minute))
+	if n := tr.Len(); n != 1 {
+		t.Fatalf("Len() = %d, want 1 (a live backoff keeps the IP)", n)
+	}
+	for i := 0; i < 3; i++ {
+		mustNotTrigger(t, tr, sshFail(ipA, 15*time.Minute+sec(i)))
+	}
+	tr.Prune(t0.Add(sec(2) + 20*time.Minute))
+	mustTrigger(t, tr, sshFail(ipA, 20*time.Minute+sec(3)))
+	tr.Forget(ipA)
+	tr.Prune(t0.Add(time.Hour))
+	if n := tr.Len(); n != 0 {
+		t.Fatalf("Len() = %d, want 0", n)
+	}
+}
+
+func TestBackoffUnknownOrEmpty(t *testing.T) {
+	tr := New(DefaultConfig())
+	tr.Backoff(ipA, time.Minute) // unknown: no-op
+	if n := tr.Len(); n != 0 {
+		t.Fatalf("Len() = %d, want 0", n)
+	}
+	// An in-flight IP whose window Prune emptied has no time to back off
+	// from: it is released like Done(false).
+	for i := 0; i < 2; i++ {
+		mustNotTrigger(t, tr, sshFail(ipA, sec(i)))
+	}
+	mustTrigger(t, tr, sshFail(ipA, sec(2)))
+	tr.Prune(t0.Add(time.Hour))
+	tr.Backoff(ipA, time.Minute)
+	if n := tr.Len(); n != 0 {
+		t.Fatalf("Len() = %d, want 0", n)
+	}
+}
