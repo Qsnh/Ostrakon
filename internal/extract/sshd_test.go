@@ -56,6 +56,20 @@ func TestParseSSHD(t *testing.T) {
 			ok:    true, ip: "198.51.100.5", kind: event.KindAuthSuccess, user: "bob",
 		},
 		{
+			name:  "accepted certificate with forged source in key id tail",
+			mode:  msg,
+			input: "Accepted publickey for alice from 198.51.100.4 port 50000 ssh2: ED25519-CERT SHA256:abc ID x from 9.9.9.9 port 1 ssh2 (serial 1) CA ED25519 SHA256:def",
+			ok:    true, ip: "198.51.100.4", kind: event.KindAuthSuccess, user: "alice",
+		},
+		{
+			// The forged "ssh2: " makes the forged text a valid tail, so a greedy
+			// user group would take the forged address.
+			name:  "accepted certificate with forged source and ssh2 colon in key id tail",
+			mode:  msg,
+			input: "Accepted publickey for alice from 198.51.100.4 port 50000 ssh2: ED25519-CERT SHA256:abc ID x from 9.9.9.9 port 1 ssh2: z (serial 1) CA ED25519 SHA256:def",
+			ok:    true, ip: "198.51.100.4", kind: event.KindAuthSuccess, user: "alice",
+		},
+		{
 			name:  "connection closed by authenticating user",
 			mode:  msg,
 			input: "Connection closed by authenticating user root 203.0.113.8 port 1234 [preauth]",

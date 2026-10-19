@@ -32,7 +32,12 @@ type sshdRule struct {
 }
 
 // sshdRules are tried in order; each is anchored with ^...$. {user} is greedy
-// so that the last "from <ip> port <n>" in the message supplies the address.
+// so that the last "from <ip> port <n>" in the message supplies the address:
+// the user name is attacker-controlled and comes before the sshd-generated
+// tail. The Accepted rule is the exception and uses the lazy {lazyuser}: its
+// user is a real local account, while the free-form tail after "ssh2: "
+// (e.g. a certificate key ID) is the part that can carry forged text, so the
+// first "from <ip> port <n> ssh2" must win.
 var sshdRules = []sshdRule{
 	newSSHDRule(`^Failed \S+ for (?:invalid user )?{user} from {ip} port \d+(?: ssh2)?$`, event.KindAuthFail),
 	newSSHDRule(`^maximum authentication attempts exceeded for (?:invalid user )?{user} from {ip} port \d+ ssh2 \[preauth\]$`, event.KindAuthFail),
@@ -40,11 +45,12 @@ var sshdRules = []sshdRule{
 	newSSHDRule(`^(?:Disconnected from|Connection closed by) invalid user {user} {ip} port \d+ \[preauth\]$`, event.KindInvalidUser),
 	newSSHDRule(`^(?:Disconnected from|Connection closed by) authenticating user {user} {ip} port \d+ \[preauth\]$`, event.KindPreauthClose),
 	newSSHDRule(`^Connection closed by {ip} port \d+ \[preauth\]$`, event.KindPreauthClose),
-	newSSHDRule(`^Accepted \S+ for {user} from {ip} port \d+ ssh2(?:: .*)?$`, event.KindAuthSuccess),
+	newSSHDRule(`^Accepted \S+ for {lazyuser} from {ip} port \d+ ssh2(?:: .*)?$`, event.KindAuthSuccess),
 }
 
 var sshdPlaceholders = strings.NewReplacer(
 	"{user}", `(?P<user>.*)`,
+	"{lazyuser}", `(?P<user>.*?)`,
 	"{ip}", `(?P<ip>[0-9A-Fa-f:.]+)`,
 )
 
