@@ -834,3 +834,170 @@ func TestTotalTracksPruneAndForget(t *testing.T) {
 		t.Fatalf("stored %d events after Forget, want 0", n)
 	}
 }
+
+// clock hands out offsets from t0 in steps of step (one second if zero).
+type clock struct {
+	n    int
+	step time.Duration
+}
+
+func (c *clock) next() time.Duration {
+	c.n++
+	if c.step == 0 {
+		return sec(c.n)
+	}
+	return time.Duration(c.n) * c.step
+}
+
+func countSSHD(evs []event.Event) int {
+	n := 0
+	for _, e := range evs {
+		if e.Source == "sshd" {
+			n++
+		}
+	}
+	return n
+}
+
+func checkAscending(t *testing.T, evs []event.Event) {
+	t.Helper()
+	for i := 1; i < len(evs); i++ {
+		if evs[i].Time.Before(evs[i-1].Time) {
+			t.Fatalf("batch not in time order at %d: %v after %v", i, evs[i].Time.Sub(t0), evs[i-1].Time.Sub(t0))
+		}
+	}
+}
+
+// Review probe: heavy GETs must not push sshd failures out of the IP's
+// memory. 300 GETs are judged benign, then 30 failures each followed by 199
+// GETs (one event every 100ms, so the whole run fits in the benign cache):
+// the third failure inside the window must trigger.
+func TestWebTrafficCannotEvictSSHFailures(t *testing.T) {
+	tr := New(DefaultConfig())
+	c := &clock{step: 100 * time.Millisecond}
+	for i := 1; i < 300; i++ {
+		mustNotTrigger(t, tr, web(ipA, c.next(), 200))
+	}
+	mustTrigger(t, tr, web(ipA, c.next(), 200))
+	tr.Done(ipA, true)
+
+	for f := 1; f <= 30; f++ {
+		if b, ok := tr.Add(sshFail(ipA, c.next())); ok {
+			if f != 3 {
+				t.Fatalf("triggered at failure %d, want 3", f)
+			}
+			if n := countSSHD(b.Events); n != 3 {
+				t.Fatalf("batch holds %d sshd failures, want 3", n)
+			}
+			checkAscending(t, b.Events)
+			return
+		}
+		for g := 0; g < 199; g++ {
+			mustNotTrigger(t, tr, web(ipA, c.next(), 200))
+		}
+	}
+	t.Fatal("30 sshd failures interleaved with GETs never triggered")
+}
+
+// Review probe: 49 GETs between failures must not dilute the batch down to
+// one failure. Every trigger-relevant event goes in first.
+func TestBatchKeepsTriggerRelevantEvents(t *testing.T) {
+	tr := New(DefaultConfig())
+	c := &clock{}
+	var b Batch
+	for f := 1; f <= 3; f++ {
+		if f > 1 {
+			for g := 0; g < 49; g++ {
+				mustNotTrigger(t, tr, web(ipA, c.next(), 200))
+			}
+		}
+		if f < 3 {
+			mustNotTrigger(t, tr, sshFail(ipA, c.next()))
+		} else {
+			b = mustTrigger(t, tr, sshFail(ipA, c.next()))
+		}
+	}
+	if len(b.Events) != 50 {
+		t.Fatalf("len(Events) = %d, want 50", len(b.Events))
+	}
+	if n := countSSHD(b.Events); n != 3 {
+		t.Fatalf("batch holds %d of the 3 sshd failures", n)
+	}
+	checkAscending(t, b.Events)
+	// Failures at 1s, 51s and 101s; GETs at 2-50s and 52-100s. The 47 GETs
+	// kept are the newest: 54s to 100s.
+	want := map[int]time.Duration{0: sec(1), 1: sec(51), 2: sec(54), 48: sec(100), 49: sec(101)}
+	for i, w := range want {
+		if got := b.Events[i].Time.Sub(t0); got != w {
+			t.Errorf("Events[%d] at %v, want %v", i, got, w)
+		}
+	}
+}
+
+func TestBatchFillsWithNewestOtherEvents(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxEvents = 6
+	tr := New(cfg)
+	mustNotTrigger(t, tr, web(ipA, sec(1), 200))
+	mustNotTrigger(t, tr, sshFail(ipA, sec(2)))
+	mustNotTrigger(t, tr, web(ipA, sec(3), 200))
+	mustNotTrigger(t, tr, web(ipA, sec(4), 200))
+	mustNotTrigger(t, tr, sshFail(ipA, sec(5)))
+	mustNotTrigger(t, tr, web(ipA, sec(6), 200))
+	mustNotTrigger(t, tr, web(ipA, sec(7), 200))
+	mustNotTrigger(t, tr, web(ipA, sec(8), 200))
+	b := mustTrigger(t, tr, sshFail(ipA, sec(9)))
+	want := []time.Duration{sec(2), sec(5), sec(6), sec(7), sec(8), sec(9)}
+	if len(b.Events) != len(want) {
+		t.Fatalf("len(Events) = %d, want %d", len(b.Events), len(want))
+	}
+	for i, w := range want {
+		if got := b.Events[i].Time.Sub(t0); got != w {
+			t.Errorf("Events[%d] at %v, want %v", i, got, w)
+		}
+	}
+}
+
+func TestBatchRelevantBeyondMaxEventsKeepsNewest(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxEvents = 4
+	tr := New(cfg)
+	mustNotTrigger(t, tr, sshFail(ipA, sec(1)))
+	mustNotTrigger(t, tr, sshFail(ipA, sec(2)))
+	for i := 3; i <= 10; i++ {
+		mustNotTrigger(t, tr, web(ipA, sec(i), 200))
+	}
+	for i := 11; i <= 19; i++ {
+		mustNotTrigger(t, tr, web(ipA, sec(i), 404))
+	}
+	b := mustTrigger(t, tr, sshFail(ipA, sec(20)))
+	want := []time.Duration{sec(17), sec(18), sec(19), sec(20)}
+	if len(b.Events) != len(want) {
+		t.Fatalf("len(Events) = %d, want %d", len(b.Events), len(want))
+	}
+	for i, w := range want {
+		if got := b.Events[i].Time.Sub(t0); got != w {
+			t.Errorf("Events[%d] at %v, want %v", i, got, w)
+		}
+	}
+}
+
+// PerIPCap bounds each source's buffer separately.
+func TestPerIPCapIsPerSource(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PerIPCap = 4
+	tr := New(cfg)
+	mustNotTrigger(t, tr, sshFail(ipA, sec(1)))
+	mustNotTrigger(t, tr, sshFail(ipA, sec(2)))
+	for i := 3; i <= 12; i++ {
+		mustNotTrigger(t, tr, web(ipA, sec(i), 200))
+	}
+	b := mustTrigger(t, tr, sshFail(ipA, sec(13)))
+	if len(b.Events) != 7 || countSSHD(b.Events) != 3 {
+		t.Fatalf("batch has %d events, %d sshd; want 7 (3 sshd + 4 nginx kept by PerIPCap)", len(b.Events), countSSHD(b.Events))
+	}
+	if got := b.Events[2].Time.Sub(t0); got != sec(9) {
+		t.Errorf("oldest nginx event kept at %v, want 9s (the newest four)", got)
+	}
+	checkAscending(t, b.Events)
+}

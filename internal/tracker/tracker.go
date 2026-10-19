@@ -32,8 +32,8 @@ const (
 type Config struct {
 	Window    time.Duration // how far back events count
 	BenignTTL time.Duration // how long a "benign" verdict is remembered
-	MaxEvents int           // events per Batch (the newest ones)
-	PerIPCap  int           // events kept per IP
+	MaxEvents int           // events per Batch
+	PerIPCap  int           // events kept per IP and source
 	MaxIPs    int           // tracked IPs; least recently active is evicted
 
 	// MaxTotalEvents bounds the events held across all IPs; least recently
@@ -54,8 +54,11 @@ func DefaultConfig() Config {
 	}
 }
 
-// Batch is what to ask Jev about: the newest events of one IP, across all
-// sources, in ascending time order. Events is a private copy.
+// Batch is what to ask Jev about: at most MaxEvents events of one IP, in
+// ascending time order. The newest trigger-relevant events (sshd failures,
+// nginx 4xx) of every source come first; the newest other events fill the
+// remaining room, so ordinary traffic cannot crowd out the evidence. Events is
+// a private copy.
 type Batch struct {
 	IP     netip.Addr
 	Events []event.Event
@@ -74,14 +77,22 @@ type Tracker struct {
 // ipState is everything remembered about one IP.
 type ipState struct {
 	ip netip.Addr
-	// events is sorted ascending by Time and every entry is less than Window
-	// older than the last one.
-	events   []event.Event
+	// bufs holds one buffer per source, so that heavy traffic from one
+	// source cannot push another's events out. Every event is less than
+	// Window older than the newest event of any buffer.
+	bufs     []buffer
 	inFlight bool // a Batch was handed out and neither Done nor Forget has followed
 
 	benign      bool      // a benign verdict is cached
 	benignBase  counts    // the window's tallies when it was cached
 	benignUntil time.Time // last event time at caching + BenignTTL
+}
+
+// buffer is one source's events for an IP, sorted ascending by Time and at
+// most PerIPCap long.
+type buffer struct {
+	source string
+	events []event.Event
 }
 
 // counts are the per-source tallies the trigger rules look at.
@@ -153,9 +164,8 @@ func (t *Tracker) Add(ev event.Event) (Batch, bool) {
 	st := el.Value.(*ipState)
 
 	before := st.size()
-	st.insert(compact(ev))
+	st.insert(compact(ev), t.cfg.PerIPCap)
 	st.expire(st.newest(), t.cfg.Window)
-	st.capTo(t.cfg.PerIPCap)
 	t.total += st.size() - before
 	t.enforceBudget(el)
 
@@ -174,7 +184,7 @@ func (t *Tracker) Add(ev event.Event) (Batch, bool) {
 		return Batch{}, false
 	}
 	st.inFlight = true
-	return Batch{IP: ev.IP, Events: st.latest(t.cfg.MaxEvents)}, true
+	return Batch{IP: ev.IP, Events: st.batch(t.cfg.MaxEvents)}, true
 }
 
 // Done ends the decision started by Add. With benign=true the verdict is
@@ -193,7 +203,7 @@ func (t *Tracker) Done(ip netip.Addr, benign bool) {
 	}
 	st := el.Value.(*ipState)
 	st.inFlight = false
-	if benign && len(st.events) > 0 {
+	if benign && st.size() > 0 {
 		st.benign = true
 		st.benignBase = st.count()
 		st.benignUntil = st.newest().Add(t.cfg.BenignTTL)
@@ -245,9 +255,9 @@ func (t *Tracker) enforceBudget(cur *list.Element) {
 		back := t.lru.Back()
 		if back == cur {
 			st := cur.Value.(*ipState)
-			before := st.size()
-			st.capTo(st.size() - (t.total - t.cfg.MaxTotalEvents))
-			t.total += st.size() - before
+			excess := t.total - t.cfg.MaxTotalEvents
+			st.dropOldest(excess)
+			t.total -= excess
 			return
 		}
 		t.remove(back)
@@ -269,16 +279,30 @@ func (t *Tracker) remove(el *list.Element) {
 
 // dropIfIdle forgets the IP when nothing about it is worth remembering.
 func (t *Tracker) dropIfIdle(el *list.Element) {
-	if st := el.Value.(*ipState); len(st.events) == 0 && !st.inFlight && !st.benign {
+	if st := el.Value.(*ipState); st.size() == 0 && !st.inFlight && !st.benign {
 		t.remove(el)
 	}
 }
 
 // size is the number of events held.
-func (s *ipState) size() int { return len(s.events) }
+func (s *ipState) size() int {
+	n := 0
+	for i := range s.bufs {
+		n += len(s.bufs[i].events)
+	}
+	return n
+}
 
-// all returns the events held, oldest first.
-func (s *ipState) all() []event.Event { return s.events }
+// all returns a fresh slice of every event held, oldest first. Events with
+// equal times keep the order of their buffers.
+func (s *ipState) all() []event.Event {
+	out := make([]event.Event, 0, s.size())
+	for i := range s.bufs {
+		out = append(out, s.bufs[i].events...)
+	}
+	slices.SortStableFunc(out, func(a, b event.Event) int { return a.Time.Compare(b.Time) })
+	return out
+}
 
 // compact returns ev with every string field cut to event.MaxField runes and
 // copied into its own memory. Extractors hand out substrings of the log line,
@@ -312,62 +336,139 @@ func cut(s string) string {
 	return strings.Clone(s)
 }
 
-// newest is the time of the latest event. The window must not be empty.
-func (s *ipState) newest() time.Time { return s.events[len(s.events)-1].Time }
-
-// insert places ev in time order, after any events with an equal time.
-func (s *ipState) insert(ev event.Event) {
-	i := len(s.events)
-	for i > 0 && s.events[i-1].Time.After(ev.Time) {
-		i--
+// newest is the time of the latest event of any source. The window must not
+// be empty.
+func (s *ipState) newest() time.Time {
+	var t time.Time
+	for i := range s.bufs {
+		if evs := s.bufs[i].events; len(evs) > 0 {
+			if last := evs[len(evs)-1].Time; t.IsZero() || last.After(t) {
+				t = last
+			}
+		}
 	}
-	s.events = slices.Insert(s.events, i, ev)
+	return t
 }
 
-// expire drops events that are Window or more older than ref.
+// insert places ev in its source's buffer in time order, after any events
+// with an equal time, then drops that buffer's oldest events beyond limit.
+func (s *ipState) insert(ev event.Event, limit int) {
+	i := slices.IndexFunc(s.bufs, func(b buffer) bool { return b.source == ev.Source })
+	if i < 0 {
+		s.bufs = append(s.bufs, buffer{source: ev.Source})
+		i = len(s.bufs) - 1
+	}
+	b := &s.bufs[i]
+	j := len(b.events)
+	for j > 0 && b.events[j-1].Time.After(ev.Time) {
+		j--
+	}
+	b.events = slices.Insert(b.events, j, ev)
+	if extra := len(b.events) - limit; extra > 0 {
+		b.events = slices.Delete(b.events, 0, extra)
+	}
+}
+
+// expire drops events that are Window or more older than ref, and buffers
+// left empty.
 func (s *ipState) expire(ref time.Time, window time.Duration) {
-	keep := slices.IndexFunc(s.events, func(e event.Event) bool { return ref.Sub(e.Time) < window })
-	if keep < 0 {
-		keep = len(s.events)
+	for i := range s.bufs {
+		b := &s.bufs[i]
+		keep := slices.IndexFunc(b.events, func(e event.Event) bool { return ref.Sub(e.Time) < window })
+		if keep < 0 {
+			keep = len(b.events)
+		}
+		b.events = slices.Delete(b.events, 0, keep)
 	}
-	if keep == 0 {
-		return
-	}
-	s.events = slices.Delete(s.events, 0, keep)
-	if len(s.events) == 0 {
-		s.events = nil // let a quiet IP's buffer go
+	s.bufs = slices.DeleteFunc(s.bufs, func(b buffer) bool { return len(b.events) == 0 })
+	if len(s.bufs) == 0 {
+		s.bufs = nil // let a quiet IP's buffers go
 	}
 }
 
-// capTo drops the oldest events beyond limit.
-func (s *ipState) capTo(limit int) {
-	if extra := len(s.events) - limit; extra > 0 {
-		s.events = slices.Delete(s.events, 0, extra)
+// dropOldest removes the n oldest events across all sources.
+func (s *ipState) dropOldest(n int) {
+	for ; n > 0; n-- {
+		oldest := -1
+		for i := range s.bufs {
+			if len(s.bufs[i].events) == 0 {
+				continue
+			}
+			if oldest < 0 || s.bufs[i].events[0].Time.Before(s.bufs[oldest].events[0].Time) {
+				oldest = i
+			}
+		}
+		if oldest < 0 {
+			return
+		}
+		s.bufs[oldest].events = slices.Delete(s.bufs[oldest].events, 0, 1)
 	}
+	s.bufs = slices.DeleteFunc(s.bufs, func(b buffer) bool { return len(b.events) == 0 })
+}
+
+// relevant reports whether e counts towards the sshd or the nginx 4xx
+// trigger.
+func relevant(e *event.Event) bool {
+	switch e.Source {
+	case sourceSSHD:
+		switch e.Kind {
+		case event.KindAuthFail, event.KindInvalidUser, event.KindPreauthClose:
+			return true
+		}
+	case sourceNginx:
+		return e.Status >= 400 && e.Status <= 499
+	}
+	return false
 }
 
 // count tallies the stored events by the trigger rules.
 func (s *ipState) count() counts {
 	var c counts
-	for i := range s.events {
-		e := &s.events[i]
-		switch e.Source {
-		case sourceSSHD:
-			switch e.Kind {
-			case event.KindAuthFail, event.KindInvalidUser, event.KindPreauthClose:
-				c.sshdRelevant++
-			}
-		case sourceNginx:
-			c.nginxTotal++
-			if e.Status >= 400 && e.Status <= 499 {
-				c.nginxRelevant++
+	for i := range s.bufs {
+		for j := range s.bufs[i].events {
+			e := &s.bufs[i].events[j]
+			switch e.Source {
+			case sourceSSHD:
+				if relevant(e) {
+					c.sshdRelevant++
+				}
+			case sourceNginx:
+				c.nginxTotal++
+				if relevant(e) {
+					c.nginxRelevant++
+				}
 			}
 		}
 	}
 	return c
 }
 
-// latest copies the newest n events.
-func (s *ipState) latest(n int) []event.Event {
-	return slices.Clone(s.events[max(0, len(s.events)-n):])
+// batch picks at most n events: the newest relevant ones first, then the
+// newest of the rest, returned oldest first.
+func (s *ipState) batch(n int) []event.Event {
+	evs := s.all()
+	if len(evs) <= n {
+		return evs
+	}
+	keep := make([]bool, len(evs))
+	k := 0
+	for i := len(evs) - 1; i >= 0 && k < n; i-- {
+		if relevant(&evs[i]) {
+			keep[i] = true
+			k++
+		}
+	}
+	for i := len(evs) - 1; i >= 0 && k < n; i-- {
+		if !keep[i] {
+			keep[i] = true
+			k++
+		}
+	}
+	out := make([]event.Event, 0, k)
+	for i := range evs {
+		if keep[i] {
+			out = append(out, evs[i])
+		}
+	}
+	return out
 }
