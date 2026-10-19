@@ -161,4 +161,21 @@ wait_for "the restarted daemon finished starting" 10 daemon_started
 not_banned 203.0.113.7 || fail "203.0.113.7 was restored after a restart although it had been unbanned"
 echo "ok: 203.0.113.7 stays unbanned after the restart"
 
+step="8: a table flushed away at runtime is rebuilt with its bans"
+echo "== step $step"
+nft flush ruleset
+if nft list table inet ostrakon >/dev/null 2>&1; then
+	fail "the table survived nft flush ruleset"
+fi
+# The daemon checks once a minute.
+wait_for "203.0.113.9 back in banned_v4 after nft flush ruleset" 75 banned 203.0.113.9
+grep -q 'msg="nftables table missing; rebuilding"' "$daemon_log" ||
+	fail "the rebuild was not logged"
+not_banned 203.0.113.7 || fail "203.0.113.7 was restored by the rebuild although it had been unbanned"
+out=$(ostrakon status) || fail "ostrakon status failed: $out"
+if grep -q '^firewall:' <<<"$out"; then
+	fail "ostrakon status still reports a firewall problem after the rebuild:"$'\n'"$out"
+fi
+echo "ok: the rebuilt table holds the stored bans and status shows no firewall problem"
+
 echo "E2E PASS"
