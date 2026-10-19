@@ -23,6 +23,7 @@ import (
 	"ostrakon/internal/health"
 	"ostrakon/internal/jev"
 	"ostrakon/internal/judge"
+	"ostrakon/internal/logging"
 	"ostrakon/internal/notify"
 	"ostrakon/internal/source"
 	"ostrakon/internal/state"
@@ -55,7 +56,9 @@ func runDaemon(args []string, stderr io.Writer) int {
 		return exitError
 	}
 
-	log := slog.New(slog.NewTextHandler(stderr, nil))
+	// Under systemd, JOURNAL_STREAM is set and each line carries its
+	// priority, so that `journalctl -p err` shows a pause.
+	log := slog.New(logging.NewHandler(stderr, os.Getenv("JOURNAL_STREAM") != ""))
 	slog.SetDefault(log)
 
 	store, err := state.Open(state.DefaultPath, time.Now())

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ostrakon/internal/jev"
+	"ostrakon/internal/logging"
 	"ostrakon/internal/notify"
 )
 
@@ -112,7 +113,7 @@ func (m *Monitor) resume() {
 	m.streakStart = time.Time{}
 	m.mu.Unlock()
 
-	m.log.Info("protection resumed")
+	m.log.Log(context.Background(), logging.LevelNotice, "protection resumed")
 	m.notifier.Resumed(at)
 }
 

@@ -15,6 +15,7 @@ import (
 	"ostrakon/internal/apikey"
 	"ostrakon/internal/jev"
 	"ostrakon/internal/judge"
+	"ostrakon/internal/logging"
 )
 
 // fakeClock is a manually advanced clock, safe for concurrent use.
@@ -127,7 +128,7 @@ func newRig() *rig {
 	c := newClock()
 	nt := &fakeNotifier{}
 	logs := &bytes.Buffer{}
-	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug, ReplaceAttr: logging.ReplaceLevel}))
 	return &rig{clock: c, sl: &fakeSleeper{clock: c}, nt: nt, m: NewMonitor(c.now, nt, log), logs: logs}
 }
 
@@ -460,8 +461,10 @@ func TestProbeLoop(t *testing.T) {
 	if want := r.clock.now(); !r.nt.resumeA[0].Equal(want) {
 		t.Errorf("resumed at %v, want %v", r.nt.resumeA[0], want)
 	}
-	if !strings.Contains(r.logs.String(), `level=INFO msg="protection resumed"`) {
-		t.Errorf("log lacks Info \"protection resumed\":\n%s", r.logs.String())
+	// Notice, so that journald files the end of a pause apart from routine
+	// Info lines.
+	if !strings.Contains(r.logs.String(), `level=NOTICE msg="protection resumed"`) {
+		t.Errorf("log lacks Notice \"protection resumed\":\n%s", r.logs.String())
 	}
 }
 
