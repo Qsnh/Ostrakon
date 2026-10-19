@@ -779,6 +779,48 @@ func TestQueueFullDropsAndRetriggers(t *testing.T) {
 	waitFor(t, "the dropped IP to trigger again", func() bool { return h.dec.countFor("203.0.113.82") == 1 })
 }
 
+// A flood that keeps the queue full logs at most one Warn a minute, which
+// says how many batches were dropped since the previous one.
+func TestQueueFullWarnRateLimited(t *testing.T) {
+	h := newHarness(t)
+	clock := &fakeClock{t: time.Now()}
+	h.deps.Now = clock.now
+	h.deps.Workers = 1
+	release := make(chan struct{})
+	var once sync.Once
+	h.dec.setAnswer(func(ip netip.Addr) (judge.Decision, error) {
+		if ip == netip.MustParseAddr("203.0.113.190") {
+			<-release
+		}
+		return benignDecision, nil
+	})
+	h.start(func(d *Daemon) { d.queueCap = 1 })
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	h.send(repeat(failLine("203.0.113.190"), 3)...)
+	waitFor(t, "the only worker to be busy", func() bool { return h.dec.countFor("203.0.113.190") == 1 })
+	h.send(repeat(failLine("203.0.113.191"), 3)...) // fills the queue
+	for i := range 5 {                              // five dropped batches within a minute
+		h.send(repeat(failLine(fmt.Sprintf("203.0.113.%d", 200+i)), 3)...)
+	}
+	h.barrier()
+	const msg = `level=WARN msg="decision queue full; dropping batches"`
+	if logs := h.logs.String(); strings.Count(logs, msg) != 1 || !strings.Contains(logs, msg+" dropped=1 ip=203.0.113.200") {
+		t.Fatalf("want one Warn for the first drop:\n%s", logs)
+	}
+
+	clock.advance(time.Minute)
+	h.send(repeat(failLine("203.0.113.210"), 3)...)
+	h.barrier()
+	logs := h.logs.String()
+	if n := strings.Count(logs, msg); n != 2 {
+		t.Errorf("%d queue-full Warns, want 2:\n%s", n, logs)
+	}
+	if !strings.Contains(logs, msg+" dropped=5 ip=203.0.113.210") {
+		t.Errorf("the second Warn does not count the 5 batches dropped since the first:\n%s", logs)
+	}
+}
+
 func TestLoginDuringDecisionNotBanned(t *testing.T) {
 	h := newHarness(t)
 	release := make(chan struct{})

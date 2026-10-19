@@ -42,6 +42,8 @@ const (
 	// before it may trigger another one, so that a request Jev keeps
 	// rejecting is not re-sent (and billed) for every new log line.
 	failureBackoff = 5 * time.Minute
+	// queueFullLogEvery limits the "decision queue full" Warn.
+	queueFullLogEvery = time.Minute
 
 	sessionsRefresh       = 30 * time.Second
 	localRefresh          = 5 * time.Minute
@@ -122,6 +124,11 @@ type Daemon struct {
 	// The latest refresh errors ("" after a success). Only Run, before it
 	// starts maintain, and then maintain use them.
 	sessionsErr, localErr string
+
+	// Batches dropped on a full queue since the last Warn, and its time.
+	// Only Run's goroutine (handle) uses them.
+	dropped       int
+	droppedLogged time.Time
 
 	// repairMu lets one firewall repair run at a time: a vanished table
 	// makes every concurrent ban fail, and one rebuild is enough.
@@ -349,8 +356,20 @@ func (d *Daemon) handle(ln source.Line, jobs chan<- tracker.Batch) {
 	case jobs <- b:
 	default:
 		d.tracker.Done(b.IP, false)
-		d.log.Warn("decision queue full; dropping this batch", "ip", b.IP, "queued", cap(jobs))
+		d.noteDropped(b.IP, now, cap(jobs))
 	}
+}
+
+// noteDropped counts a batch dropped because the queue was full and logs a
+// Warn at most once per queueFullLogEvery, with the number dropped since the
+// previous one: a flood fills the queue on every line. Only handle calls it.
+func (d *Daemon) noteDropped(ip netip.Addr, now time.Time, queued int) {
+	d.dropped++
+	if !d.droppedLogged.IsZero() && now.Sub(d.droppedLogged) < queueFullLogEvery && !now.Before(d.droppedLogged) {
+		return
+	}
+	d.log.Warn("decision queue full; dropping batches", "dropped", d.dropped, "ip", ip, "queued", queued)
+	d.dropped, d.droppedLogged = 0, now
 }
 
 func (d *Daemon) work(ctx context.Context, jobs <-chan tracker.Batch) {
