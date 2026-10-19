@@ -1199,6 +1199,193 @@ func TestBanFailureRecorded(t *testing.T) {
 	waitFor(t, "the firewall error cleared", func() bool { return h.d.Status().Firewall == "" })
 }
 
+// Review R-1: an administrator who was wrongly banned flushes nftables from
+// the console and logs in from the banned address; the repair that follows
+// must not ban them again (the prerouting drop would kill their session).
+func TestRepairDropsBanOfAllowlistedAddress(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	const admin, other = "198.51.100.4", "203.0.113.142"
+	for _, b := range []state.Ban{
+		// Expires first, so a restore reaches it before the other ban.
+		{IP: netip.MustParseAddr(admin), Since: now.Add(-10 * time.Minute), Until: now.Add(20 * time.Minute), Category: "ssh_bruteforce"},
+		{IP: netip.MustParseAddr(other), Since: now.Add(-10 * time.Minute), Until: now.Add(50 * time.Minute), Category: "ssh_bruteforce"},
+	} {
+		if err := h.store.AddBan(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.start(func(d *Daemon) { d.firewallCheckEvery = 5 * time.Millisecond })
+	h.barrier()
+	if h.bannedCount() != 2 {
+		t.Fatalf("firewall holds %d bans after start-up, want both stored bans", h.bannedCount())
+	}
+
+	// The administrator gets in (their ban gone with the table, below) ...
+	h.send(acceptedLine(admin))
+	h.barrier()
+	// ... and the next periodic check finds the table missing.
+	h.fw.Mu.Lock()
+	h.fw.Missing = true // nft flush ruleset from the console
+	clear(h.fw.Banned)
+	ensures := h.fw.EnsureCalls
+	h.fw.Mu.Unlock()
+
+	waitFor(t, "the table rebuilt and the other ban restored", func() bool {
+		h.fw.Mu.Lock()
+		defer h.fw.Mu.Unlock()
+		_, ok := h.fw.Banned[netip.MustParseAddr(other)]
+		return !h.fw.Missing && h.fw.EnsureCalls > ensures && ok
+	})
+	h.d.repairMu.Lock() // wait for the repair to finish
+	h.d.repairMu.Unlock()
+
+	if _, ok := h.banned(admin); ok {
+		t.Errorf("the repair banned %s again, which logged in successfully", admin)
+	}
+	bans := h.store.ActiveBans(time.Now())
+	if len(bans) != 1 || bans[0].IP != netip.MustParseAddr(other) {
+		t.Errorf("stored bans = %+v, want only %s", bans, other)
+	}
+	if want := `level=INFO msg="dropping ban of an allowlisted address" ip=` + admin; !strings.Contains(h.logs.String(), want) {
+		t.Errorf("logs lack %q:\n%s", want, h.logs.String())
+	}
+	if st := h.d.Status(); st.Firewall != "" {
+		t.Errorf("Status().Firewall = %q after the repair, want empty", st.Firewall)
+	}
+}
+
+// Review R-1 at start-up: the allowlist is complete (the administrator's
+// entries, the login sessions) before the stored bans are restored, and a
+// stored ban on an address allowlisted now is dropped, not restored.
+func TestStartupDropsBanOfAllowlistedAddress(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	const allowed, session, attacker = "198.51.100.20", "203.0.113.21", "203.0.113.22"
+	for _, ip := range []string{allowed, session, attacker} {
+		if err := h.store.AddBan(state.Ban{IP: netip.MustParseAddr(ip), Since: now.Add(-10 * time.Minute),
+			Until: now.Add(50 * time.Minute), Category: "ssh_bruteforce"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.store.Allow(netip.MustParsePrefix("198.51.100.0/24")); err != nil {
+		t.Fatal(err)
+	}
+	h.deps.Sessions = func() ([]netip.Addr, error) { return []netip.Addr{netip.MustParseAddr(session)}, nil }
+	// A restart of the service (not a reboot) leaves the table and its
+	// bans in place, and Ensure keeps them.
+	h.fw.Banned[netip.MustParseAddr(allowed)] = 50 * time.Minute
+	h.start()
+	h.barrier() // Run reads lines only after restoring
+
+	for _, ip := range []string{allowed, session} {
+		if _, ok := h.banned(ip); ok {
+			t.Errorf("firewall bans %s, an allowlisted address, after start-up", ip)
+		}
+	}
+	if _, ok := h.banned(attacker); !ok {
+		t.Errorf("the ban of %s was not restored", attacker)
+	}
+	bans := h.store.ActiveBans(time.Now())
+	if len(bans) != 1 || bans[0].IP != netip.MustParseAddr(attacker) {
+		t.Errorf("stored bans = %+v, want only %s", bans, attacker)
+	}
+	logs := h.logs.String()
+	for _, ip := range []string{allowed, session} {
+		if want := `level=INFO msg="dropping ban of an allowlisted address" ip=` + ip; !strings.Contains(logs, want) {
+			t.Errorf("logs lack %q:\n%s", want, logs)
+		}
+	}
+}
+
+// unbanFailsFirewall is a firewall.Fake that cannot lift bans.
+type unbanFailsFirewall struct{ *firewall.Fake }
+
+func (unbanFailsFirewall) Unban(context.Context, netip.Addr) error {
+	return errors.New("nft: Operation not permitted")
+}
+
+// A stored ban on an allowlisted address whose firewall entry cannot be
+// lifted is still not put back, stays listed for the next restore to retry,
+// and the failure is shown.
+func TestDropAllowlistedBanUnbanFails(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	const ip = "198.51.100.40"
+	if err := h.store.AddBan(state.Ban{IP: netip.MustParseAddr(ip), Since: now, Until: now.Add(time.Hour), Category: "ssh_bruteforce"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.Allow(netip.MustParsePrefix(ip + "/32")); err != nil {
+		t.Fatal(err)
+	}
+	h.deps.Firewall = unbanFailsFirewall{h.fw}
+	h.start()
+	h.barrier()
+
+	if _, ok := h.banned(ip); ok {
+		t.Error("the ban of an allowlisted address was put back")
+	}
+	if bans := h.store.ActiveBans(time.Now()); len(bans) != 1 {
+		t.Errorf("stored bans = %+v, want the ban kept for the next restore", bans)
+	}
+	if got := h.d.Status().Firewall; !strings.Contains(got, "Operation not permitted") {
+		t.Errorf("Status().Firewall = %q, want the unban error", got)
+	}
+	if want := `level=ERROR msg="cannot lift the ban of an allowlisted address" ip=` + ip; !strings.Contains(h.logs.String(), want) {
+		t.Errorf("logs lack %q:\n%s", want, h.logs.String())
+	}
+}
+
+// hookFirewall is a firewall.Fake whose Ensure first calls onEnsure, so that
+// something can happen while the table is being rebuilt.
+type hookFirewall struct {
+	*firewall.Fake
+	onEnsure func()
+}
+
+func (f *hookFirewall) Ensure(ctx context.Context) error {
+	f.onEnsure()
+	return f.Fake.Ensure(ctx)
+}
+
+// Review R-1: the retry after a failed ban re-checks the allowlist, since
+// the repair takes time and the address may have logged in meanwhile.
+func TestBanRetrySkipsAddressAllowlistedDuringRepair(t *testing.T) {
+	h := newHarness(t)
+	const ip = "198.51.100.30"
+	var armed atomic.Bool
+	h.deps.Firewall = &hookFirewall{Fake: h.fw, onEnsure: func() {
+		if armed.Load() {
+			// The administrator logs in from ip during the repair.
+			h.deps.Allow.NoteSuccess(netip.MustParseAddr(ip), time.Now())
+		}
+	}}
+	h.start()
+	h.barrier()
+	h.fw.Mu.Lock()
+	h.fw.Missing = true // the first Ban fails, as nft does on a vanished table
+	h.fw.Mu.Unlock()
+	armed.Store(true)
+
+	h.send(repeat(failLine(ip), 3)...)
+	waitFor(t, "the decision recorded", func() bool { return h.d.Status().LastDecision != "" })
+	if got, want := h.d.Status().LastDecision, " "+ip+" ssh_bruteforce p=0.93 skipped (allowlisted)"; !strings.HasSuffix(got, want) {
+		t.Errorf("LastDecision = %q, want suffix %q", got, want)
+	}
+	if _, ok := h.banned(ip); ok {
+		t.Error("the retry banned an address that logged in during the repair")
+	}
+	if bans := h.store.ActiveBans(time.Now()); len(bans) != 0 {
+		t.Errorf("stored bans = %+v, want none", bans)
+	}
+	h.fw.Mu.Lock()
+	ensures := h.fw.EnsureCalls
+	h.fw.Mu.Unlock()
+	if ensures != 2 {
+		t.Errorf("EnsureCalls = %d, want 2 (start-up and the repair)", ensures)
+	}
+}
+
 // A periodic check that cannot run is shown, and logged once rather than
 // every minute.
 func TestFirewallCheckErrorShown(t *testing.T) {

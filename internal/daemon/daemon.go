@@ -185,22 +185,23 @@ func sourceLabel(s source.Spec) string {
 	return s.Name + "(journald)"
 }
 
-// Run sets up the firewall, restores the stored bans and then judges log
-// activity until ctx is done. A firewall that cannot be set up is fatal and
-// returned at once; Jev being unusable is not (protection pauses instead).
-// When ctx is done Run waits for the goroutines it started and returns nil,
-// leaving every ban in place to expire on its own.
+// Run sets up the firewall, loads the allowlist, restores the stored bans and
+// then judges log activity until ctx is done. A firewall that cannot be set
+// up is fatal and returned at once; Jev being unusable is not (protection
+// pauses instead). When ctx is done Run waits for the goroutines it started
+// and returns nil, leaving every ban in place to expire on its own.
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.deps.Firewall.Ensure(ctx); err != nil {
 		return fmt.Errorf("setting up the firewall: %w", err)
 	}
+	// Before restoring bans, which skips allowlisted addresses, and before
+	// the first line, so the administrator is protected from the start.
+	d.syncAllow()
+	d.refreshSessions()
+	d.refreshLocal()
 	if err := d.restoreBans(ctx); err != nil {
 		d.setFirewallErr("cannot restore bans", err, false)
 	}
-	d.syncAllow()
-	// Before the first line, so the administrator is protected from the start.
-	d.refreshSessions()
-	d.refreshLocal()
 
 	jobs := make(chan tracker.Batch, d.queueCap)
 	for range d.deps.Workers {
@@ -243,12 +244,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 // firewall (its sets are empty after a reboot, or after the table was
 // rebuilt) with their remaining time, but never more than the ban's own
 // length: a clock far behind at boot must not make a 1h ban last for years.
-// It returns the first error, having tried every ban.
+// A ban on an address that is allowlisted now is dropped instead (see
+// dropAllowlistedBan). It returns the first error, having tried every ban.
 func (d *Daemon) restoreBans(ctx context.Context) error {
 	now := d.deps.Now()
 	restored := 0
 	var first error
 	for _, b := range d.deps.Store.ActiveBans(now) {
+		if d.deps.Allow.Allowed(b.IP, now) {
+			if err := d.dropAllowlistedBan(ctx, b.IP); err != nil && first == nil {
+				first = err
+			}
+			continue
+		}
 		left := min(b.Until.Sub(now), b.Until.Sub(b.Since))
 		if left < minRestoreTTL {
 			continue
@@ -266,6 +274,25 @@ func (d *Daemon) restoreBans(ctx context.Context) error {
 		d.log.Info("restored bans", "count", restored)
 	}
 	return first
+}
+
+// dropAllowlistedBan lifts and forgets the stored ban of an address that is
+// allowlisted now: putting it back could lock out an administrator who was
+// banned by mistake and has since logged in from it (or allowed it). The
+// ban may still be in the firewall, since Ensure keeps the table's contents
+// (a restart of the service, a repair after a ban failed for another reason),
+// so it is lifted there first. If that fails the stored ban is kept, so it
+// stays listed and the next restore tries again.
+func (d *Daemon) dropAllowlistedBan(ctx context.Context, ip netip.Addr) error {
+	if err := d.deps.Firewall.Unban(ctx, ip); err != nil {
+		d.log.Error("cannot lift the ban of an allowlisted address", "ip", ip, "err", err)
+		return err
+	}
+	if _, err := d.deps.Store.RemoveBan(ip); err != nil {
+		d.log.Warn("cannot remove the ban of an allowlisted address from the state file", "ip", ip, "err", err)
+	}
+	d.log.Info("dropping ban of an allowlisted address", "ip", ip)
+	return nil
 }
 
 // checkFirewall is the periodic check that Ostrakon's nftables table still
@@ -438,9 +465,7 @@ func (d *Daemon) decide(ctx context.Context, b tracker.Batch) {
 	case d.deps.Allow.Allowed(ip, d.deps.Now()):
 		// Allowlisted while Jev was deciding: a successful login, a new
 		// session, or the administrator's allow. Never ban those.
-		d.log.Info("not banning: the address is now allowlisted", "ip", ip)
-		d.tracker.Forget(ip)
-		d.recordDecision(ip, dec, "skipped (allowlisted)")
+		d.skipAllowlisted(ip, dec)
 	case d.deps.DryRun:
 		d.log.Info("would ban", "ip", ip, "category", dec.Category, "duration", dec.Duration)
 		d.tracker.Done(ip, true)
@@ -450,14 +475,27 @@ func (d *Daemon) decide(ctx context.Context, b tracker.Batch) {
 	}
 }
 
+// skipAllowlisted drops a ban decision on an address that became allowlisted
+// before the ban was made.
+func (d *Daemon) skipAllowlisted(ip netip.Addr, dec judge.Decision) {
+	d.log.Info("not banning: the address is now allowlisted", "ip", ip)
+	d.tracker.Forget(ip)
+	d.recordDecision(ip, dec, "skipped (allowlisted)")
+}
+
 // ban carries out a ban decision. A failed ban usually means the table has
-// gone, so the table is repaired and the ban tried once more.
+// gone, so the table is repaired and the ban tried once more, unless the
+// address was allowlisted meanwhile.
 func (d *Daemon) ban(ctx context.Context, ip netip.Addr, dec judge.Decision) {
 	verdict := "ban " + shortDuration(dec.Duration)
 	err := d.deps.Firewall.Ban(ctx, ip, dec.Duration)
 	if err != nil && ctx.Err() == nil {
 		d.log.Warn("ban failed; rebuilding the nftables table and trying again", "ip", ip, "err", err)
 		d.repairFirewall(ctx)
+		if d.deps.Allow.Allowed(ip, d.deps.Now()) {
+			d.skipAllowlisted(ip, dec)
+			return
+		}
 		err = d.deps.Firewall.Ban(ctx, ip, dec.Duration)
 	}
 	if err != nil {
