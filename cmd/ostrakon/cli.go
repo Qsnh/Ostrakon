@@ -29,6 +29,7 @@ const (
 const usageText = `usage: ostrakon <command>
 
 commands:
+  setup               save your Jev API key, install and start the service (root only)
   run [--dry-run]     run the daemon (root only; --dry-run logs bans instead of applying them)
   status              show whether protection is running
   bans                list the active bans
