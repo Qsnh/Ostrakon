@@ -38,7 +38,7 @@ const (
 	readTimeout = 5 * time.Second
 	// writeTimeout bounds sending the response.
 	writeTimeout = 5 * time.Second
-	// opTimeout bounds one backend operation (an unban runs nft).
+	// opTimeout bounds one backend operation (unban and allow run nft).
 	opTimeout = 10 * time.Second
 	// callTimeout bounds a whole Call; it exceeds opTimeout so that the
 	// server's own timeout is what the user sees.
@@ -68,7 +68,7 @@ type Backend interface {
 	Status() daemon.Status
 	Bans() []state.Ban
 	Unban(ctx context.Context, ip netip.Addr) error
-	Allow(p netip.Prefix) error
+	Allow(ctx context.Context, p netip.Prefix) error
 	Disallow(p netip.Prefix) error
 }
 
@@ -196,7 +196,10 @@ func dispatch(ctx context.Context, req Request, b Backend) Response {
 			return failure(err.Error())
 		}
 		if req.Cmd == "allow" {
-			return result(b.Allow(p))
+			// Allowing lifts the bans inside p, which runs nft.
+			ctx, cancel := context.WithTimeout(ctx, opTimeout)
+			defer cancel()
+			return result(b.Allow(ctx, p))
 		}
 		return result(b.Disallow(p))
 	}

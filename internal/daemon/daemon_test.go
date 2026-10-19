@@ -561,7 +561,7 @@ func TestUnbanAndAllow(t *testing.T) {
 	}
 
 	p := netip.MustParsePrefix("198.51.100.0/24")
-	if err := h.d.Allow(p); err != nil {
+	if err := h.d.Allow(ctx, p); err != nil {
 		t.Fatalf("Allow: %v", err)
 	}
 	if got := h.store.AllowList(); !slices.Equal(got, []netip.Prefix{p}) {
@@ -584,6 +584,58 @@ func TestUnbanAndAllow(t *testing.T) {
 	}
 	h.send(repeat(failLine("198.51.100.77"), 3)...)
 	waitFor(t, "198.51.100.77 judged once disallowed", func() bool { return h.dec.countFor("198.51.100.77") == 1 })
+}
+
+// Allowing a range also lifts the bans already on addresses inside it.
+func TestAllowLiftsBansInside(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	for _, ip := range []string{"203.0.113.170", "203.0.113.171", "198.51.100.172"} {
+		if err := h.store.AddBan(state.Ban{IP: netip.MustParseAddr(ip), Since: now, Until: now.Add(time.Hour), Category: "ssh_bruteforce"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.start()
+	h.barrier()
+	if n := h.bannedCount(); n != 3 {
+		t.Fatalf("firewall holds %d bans after start-up, want 3", n)
+	}
+
+	// An IPv4-mapped prefix means the same IPv4 range.
+	if err := h.d.Allow(context.Background(), netip.MustParsePrefix("::ffff:203.0.113.0/120")); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+	for _, ip := range []string{"203.0.113.170", "203.0.113.171"} {
+		if _, ok := h.banned(ip); ok {
+			t.Errorf("firewall still bans %s after allowing its range", ip)
+		}
+	}
+	if _, ok := h.banned("198.51.100.172"); !ok {
+		t.Error("the ban outside the allowed range was lifted")
+	}
+	bans := h.store.ActiveBans(time.Now())
+	if len(bans) != 1 || bans[0].IP != netip.MustParseAddr("198.51.100.172") {
+		t.Errorf("stored bans = %+v, want only 198.51.100.172", bans)
+	}
+	if n := h.d.Status().BanCount; n != 1 {
+		t.Errorf("Status().BanCount = %d, want 1", n)
+	}
+
+	// A ban the firewall refuses to lift stays listed, and Allow says so;
+	// the allowlist entry is kept.
+	h.fw.Mu.Lock()
+	h.fw.Err = errors.New("nft: Operation not permitted")
+	h.fw.Mu.Unlock()
+	err := h.d.Allow(context.Background(), netip.MustParsePrefix("198.51.100.172/32"))
+	if err == nil || !strings.Contains(err.Error(), "198.51.100.172") || !strings.Contains(err.Error(), "Operation not permitted") {
+		t.Errorf("Allow = %v, want an error naming the ban it could not lift", err)
+	}
+	if got := h.store.AllowList(); len(got) != 2 {
+		t.Errorf("store allowlist = %v, want both prefixes", got)
+	}
+	if n := len(h.store.ActiveBans(time.Now())); n != 1 {
+		t.Errorf("store holds %d bans, want the one still in the firewall", n)
+	}
 }
 
 func TestSessionsProtectFromFirstLine(t *testing.T) {

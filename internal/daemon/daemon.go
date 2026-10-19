@@ -692,15 +692,28 @@ func (d *Daemon) Unban(ctx context.Context, ip netip.Addr) error {
 	return nil
 }
 
-// Allow adds p to the administrator's allowlist (saved in the state file).
-func (d *Daemon) Allow(p netip.Prefix) error {
+// Allow adds p to the administrator's allowlist (saved in the state file)
+// and lifts the active bans on addresses inside p. A ban that cannot be
+// lifted stays listed and is named in the error; p stays allowed.
+func (d *Daemon) Allow(ctx context.Context, p netip.Prefix) error {
 	d.allowMu.Lock()
 	defer d.allowMu.Unlock()
 	if err := d.deps.Store.Allow(p); err != nil {
 		return err
 	}
 	d.deps.Allow.SetUser(d.deps.Store.AllowList())
-	return nil
+
+	p = netutil.NormPrefix(p)
+	var errs []error
+	for _, b := range d.deps.Store.ActiveBans(d.deps.Now()) {
+		if !p.Contains(b.IP) {
+			continue
+		}
+		if err := d.Unban(ctx, b.IP); err != nil {
+			errs = append(errs, fmt.Errorf("allowed, but the ban on %s was not lifted: %w", b.IP, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Disallow removes p from the administrator's allowlist. Removing a prefix

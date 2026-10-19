@@ -42,7 +42,7 @@ func (f *fakeBackend) Unban(_ context.Context, ip netip.Addr) error {
 	return f.err
 }
 
-func (f *fakeBackend) Allow(p netip.Prefix) error {
+func (f *fakeBackend) Allow(_ context.Context, p netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.allowed = append(f.allowed, p)
