@@ -195,17 +195,23 @@ func TestErrorClassification(t *testing.T) {
 		wantRetryAfter time.Duration
 	}{
 		{status: 401, want: ClassAuth},
+		{status: 402, want: ClassAuth},
+		{status: 403, want: ClassAuth},
+		{status: 404, want: ClassAuth},
+		{status: 405, want: ClassAuth},
+		{status: 410, want: ClassAuth},
 		{status: 429, retryAfter: "7", want: ClassRetryable, wantRetryAfter: 7 * time.Second},
 		{status: 429, want: ClassRetryable},
 		{status: 529, want: ClassRetryable},
 		{status: 500, want: ClassRetryable},
 		{status: 503, want: ClassRetryable},
+		{status: 408, want: ClassRetryable},
+		{status: 425, want: ClassRetryable},
+		{status: 418, want: ClassRetryable}, // any other 4xx
 		{status: 400, want: ClassBadRequest},
 		{status: 413, want: ClassBadRequest},
 		{status: 415, want: ClassBadRequest},
 		{status: 422, want: ClassBadRequest},
-		{status: 403, want: ClassBadRequest}, // other 4xx
-		{status: 404, want: ClassBadRequest},
 	}
 
 	for _, tt := range tests {
@@ -534,16 +540,23 @@ func TestClassify(t *testing.T) {
 		want Class
 	}{
 		{"401", &APIError{Status: 401}, ClassAuth},
+		{"402 billing", &APIError{Status: 402}, ClassAuth},
+		{"403 forbidden", &APIError{Status: 403}, ClassAuth},
+		{"404 wrong endpoint", &APIError{Status: 404}, ClassAuth},
+		{"405", &APIError{Status: 405}, ClassAuth},
+		{"410 gone", &APIError{Status: 410}, ClassAuth},
+		{"408", &APIError{Status: 408}, ClassRetryable},
+		{"425", &APIError{Status: 425}, ClassRetryable},
 		{"429", &APIError{Status: 429}, ClassRetryable},
 		{"529", &APIError{Status: 529}, ClassRetryable},
 		{"500", &APIError{Status: 500}, ClassRetryable},
 		{"599", &APIError{Status: 599}, ClassRetryable},
+		{"other 4xx", &APIError{Status: 418}, ClassRetryable},
+		{"unexpected 3xx", &APIError{Status: 302}, ClassRetryable},
 		{"400", &APIError{Status: 400}, ClassBadRequest},
 		{"413", &APIError{Status: 413}, ClassBadRequest},
 		{"415", &APIError{Status: 415}, ClassBadRequest},
 		{"422", &APIError{Status: 422}, ClassBadRequest},
-		{"other 4xx", &APIError{Status: 418}, ClassBadRequest},
-		{"unexpected 3xx", &APIError{Status: 302}, ClassBadRequest},
 		{"wrapped APIError", fmt.Errorf("judge: %w", &APIError{Status: 503}), ClassRetryable},
 		{"ErrNoKey", apikey.ErrNoKey, ClassAuth},
 		{"wrapped ErrNoKey", fmt.Errorf("x: %w", apikey.ErrNoKey), ClassAuth},

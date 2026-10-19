@@ -49,27 +49,40 @@ type Class int
 const (
 	// ClassRetryable: Jev or the network is unavailable; back off and retry.
 	ClassRetryable Class = iota
-	// ClassAuth: the key is missing or rejected; retrying cannot help.
+	// ClassAuth: the key is missing or rejected, or the account or endpoint
+	// is unusable (billing, forbidden, wrong URL); retrying cannot help, so
+	// the caller should pause immediately.
 	ClassAuth
-	// ClassBadRequest: the request or its answer is unusable; drop this
-	// decision without treating Jev as unavailable.
+	// ClassBadRequest: this one request is unusable (400, 413, 415, 422 or an
+	// unusable answer); drop this decision without treating Jev as unavailable.
 	ClassBadRequest
 	// ClassCanceled: the caller's context ended; not a Jev failure.
 	ClassCanceled
 )
 
 // Classify maps an error from SystemOne (or from code that wraps it) to a Class.
-// Anything it does not recognize, including a nil error, is ClassBadRequest.
+//
+// For an *APIError, only the request-error statuses 400, 413, 415 and 422 are
+// ClassBadRequest, because only they say the problem is this one request.
+// 401, 402, 403, 404, 405 and 410 are ClassAuth: the key, the account or the
+// endpoint is unusable and no retry will fix it. Every other status (429, 529,
+// 408, 425, any 5xx, any other 4xx, even an unexpected 3xx) is ClassRetryable,
+// so a persistent failure ends in a visible pause instead of silently dropped
+// decisions.
+//
+// For other errors: a missing key is ClassAuth, a done caller context is
+// ClassCanceled, transport failures are ClassRetryable, and anything
+// unrecognized, including a nil error, is ClassBadRequest.
 func Classify(err error) Class {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		switch s := apiErr.Status; {
-		case s == 401:
-			return ClassAuth
-		case s == 429, s == 529, s >= 500:
-			return ClassRetryable
-		default: // 400, 413, 415, 422, other 4xx, unexpected 1xx/3xx
+		switch apiErr.Status {
+		case 400, 413, 415, 422:
 			return ClassBadRequest
+		case 401, 402, 403, 404, 405, 410:
+			return ClassAuth
+		default:
+			return ClassRetryable
 		}
 	}
 	if errors.Is(err, apikey.ErrNoKey) {
