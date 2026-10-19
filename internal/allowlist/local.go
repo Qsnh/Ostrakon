@@ -3,6 +3,8 @@ package allowlist
 import (
 	"net"
 	"net/netip"
+
+	"ostrakon/internal/netutil"
 )
 
 // LocalAddrs returns the unicast addresses assigned to this machine's
@@ -28,7 +30,7 @@ func addrsFromNet(as []net.Addr) []netip.Addr {
 			ip = v.IP
 		}
 		if na, ok := netip.AddrFromSlice(ip); ok {
-			out = append(out, normAddr(na))
+			out = append(out, netutil.NormAddr(na))
 		}
 	}
 	return out

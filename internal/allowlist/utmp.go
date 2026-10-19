@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"net/netip"
 	"os"
+
+	"ostrakon/internal/netutil"
 )
 
 // UTMPPath is where glibc keeps the table of current login sessions.
@@ -56,7 +58,7 @@ func utmpAddr(rec []byte) (netip.Addr, bool) {
 	case allZero(raw[4:]) && !allZero(raw[:4]):
 		return netip.AddrFrom4([4]byte(raw[:4])), true
 	case !allZero(raw):
-		return normAddr(netip.AddrFrom16([16]byte(raw))), true
+		return netutil.NormAddr(netip.AddrFrom16([16]byte(raw))), true
 	}
 	host := rec[utmpHostOff : utmpHostOff+utmpHostLen]
 	if i := bytes.IndexByte(host, 0); i >= 0 {
@@ -66,7 +68,7 @@ func utmpAddr(rec []byte) (netip.Addr, bool) {
 	if err != nil {
 		return netip.Addr{}, false
 	}
-	return normAddr(a), true
+	return netutil.NormAddr(a), true
 }
 
 func allZero(b []byte) bool {

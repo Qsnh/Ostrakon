@@ -232,6 +232,127 @@ func TestHistoryPruned(t *testing.T) {
 	}
 }
 
+// longBefore is an Open time early enough that Open itself prunes nothing, so
+// a reopen shows exactly what is on disk.
+var longBefore = t0.Add(-365 * 24 * time.Hour)
+
+func TestPruneDropsStaleAndPersists(t *testing.T) {
+	path := statePath(t)
+	s := mustOpen(t, path, t0)
+	day := 24 * time.Hour
+	// Expired ban, history too old: both go.
+	mustAddBan(t, s, ban("192.0.2.1", t0.Add(-31*day), time.Hour, "old"))
+	// Ban expires exactly now, history is recent: only the ban goes.
+	mustAddBan(t, s, ban("192.0.2.2", t0.Add(-time.Hour), time.Hour, "just-expired"))
+	// History exactly HistoryTTL old is kept (only older is stale); ban expired.
+	mustAddBan(t, s, ban("192.0.2.3", t0.Add(-HistoryTTL), time.Hour, "edge"))
+	// Active ban, recent history: untouched.
+	mustAddBan(t, s, ban("192.0.2.4", t0, time.Hour, "live"))
+	if err := s.Allow(prefix("198.51.100.0/24")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Prune(t0); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	check := func(label string, st *Store) {
+		t.Helper()
+		bans := st.ActiveBans(longBefore) // every ban still held, expired or not
+		if len(bans) != 1 || bans[0].IP != addr("192.0.2.4") {
+			t.Errorf("%s: bans = %v, want only 192.0.2.4", label, bans)
+		}
+		for ip, want := range map[string]int{"192.0.2.1": 0, "192.0.2.2": 1, "192.0.2.3": 1, "192.0.2.4": 1} {
+			if got := st.History(addr(ip)).Count; got != want {
+				t.Errorf("%s: History(%s).Count = %d, want %d", label, ip, got, want)
+			}
+		}
+		if al := st.AllowList(); len(al) != 1 || al[0] != prefix("198.51.100.0/24") {
+			t.Errorf("%s: AllowList = %v, Prune must not touch it", label, al)
+		}
+	}
+	check("in memory", s)
+	// Opened "in the past", so any pruning seen here was persisted by Prune.
+	check("after reopen", mustOpen(t, path, longBefore))
+}
+
+func TestPruneAtRuntimeEnforcesHistoryTTL(t *testing.T) {
+	// The scenario Prune exists for: History(ip) has no clock, so a daemon
+	// that stays up past HistoryTTL needs Prune to stop reporting old counts.
+	s := mustOpen(t, statePath(t), t0)
+	mustAddBan(t, s, ban("192.0.2.1", t0, time.Hour, "ssh"))
+	later := t0.Add(HistoryTTL + time.Minute)
+	if got := s.History(addr("192.0.2.1")).Count; got != 1 {
+		t.Fatalf("History.Count before Prune = %d, want 1", got)
+	}
+	if err := s.Prune(later); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.History(addr("192.0.2.1")).Count; got != 0 {
+		t.Fatalf("History.Count after Prune = %d, want 0", got)
+	}
+}
+
+func TestPruneWithNothingStaleDoesNotWrite(t *testing.T) {
+	path := statePath(t)
+	s := mustOpen(t, path, t0)
+	mustAddBan(t, s, ban("192.0.2.1", t0, time.Hour, "ssh"))
+
+	// With the file gone, any save would bring it back.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	// And a blocked temp path would turn any save into an error.
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Prune(t0); err != nil {
+		t.Fatalf("Prune with nothing stale = %v, want nil (no save attempted)", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("Prune with nothing stale rewrote the state file (stat err = %v)", err)
+	}
+}
+
+func TestPruneSaveFailureRollsBack(t *testing.T) {
+	path := statePath(t)
+	s := mustOpen(t, path, t0)
+	mustAddBan(t, s, ban("192.0.2.1", t0.Add(-31*24*time.Hour), time.Hour, "old"))
+	mustAddBan(t, s, ban("192.0.2.2", t0, time.Hour, "live"))
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Prune(t0); err == nil {
+		t.Fatal("Prune succeeded although the save failed")
+	}
+	bans := s.ActiveBans(longBefore)
+	if len(bans) != 2 {
+		t.Errorf("bans = %v, want both restored after the failed Prune", bans)
+	}
+	if got := s.History(addr("192.0.2.1")); got.Count != 1 {
+		t.Errorf("History(stale) = %+v, want it restored", got)
+	}
+	if cur, err := os.ReadFile(path); err != nil || string(cur) != string(onDisk) {
+		t.Errorf("state file changed after a failed Prune: %q, %v", cur, err)
+	}
+
+	// Once saving works again, the same Prune goes through.
+	if err := os.Remove(path + ".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Prune(t0); err != nil {
+		t.Fatalf("Prune after the fault cleared: %v", err)
+	}
+	if got := s.History(addr("192.0.2.1")).Count; got != 0 {
+		t.Errorf("History(stale).Count = %d after a successful retry, want 0", got)
+	}
+}
+
 func TestHistoryUnknownIP(t *testing.T) {
 	s := mustOpen(t, statePath(t), t0)
 	if h := s.History(addr("192.0.2.1")); h.Count != 0 || !h.Last.IsZero() {
@@ -723,6 +844,9 @@ func TestConcurrentUse(t *testing.T) {
 				s.ActiveBans(t0)
 				s.History(addr(own))
 				s.AllowList()
+				if err := s.Prune(t0); err != nil {
+					t.Errorf("Prune: %v", err)
+				}
 				if i%5 == 0 {
 					p := prefix(fmt.Sprintf("192.0.2.%d/32", w+1))
 					if err := s.Allow(p); err != nil {

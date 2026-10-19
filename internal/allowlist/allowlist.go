@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"ostrakon/internal/netutil"
 )
 
 // SuccessTTL is how long an address stays exempt after a successful login.
@@ -51,7 +53,7 @@ func New() *List {
 // IPv6 addresses are treated as the IPv4 address they carry; an invalid
 // address is not allowed.
 func (l *List) Allowed(ip netip.Addr, now time.Time) bool {
-	ip = normAddr(ip)
+	ip = netutil.NormAddr(ip)
 	if !ip.IsValid() {
 		return false
 	}
@@ -91,7 +93,7 @@ func (l *List) SetSessions(addrs []netip.Addr) {
 // NoteSuccess records a successful login from ip at now, exempting it until
 // now+SuccessTTL. Every call refreshes the expiry (it is never shortened).
 func (l *List) NoteSuccess(ip netip.Addr, now time.Time) {
-	ip = normAddr(ip)
+	ip = netutil.NormAddr(ip)
 	if !ip.IsValid() {
 		return
 	}
@@ -115,7 +117,7 @@ func (l *List) NoteSuccess(ip netip.Addr, now time.Time) {
 func (l *List) SetUser(p []netip.Prefix) {
 	norm := make([]netip.Prefix, 0, len(p))
 	for _, pf := range p {
-		if pf = normPrefix(pf); pf.IsValid() {
+		if pf = netutil.NormPrefix(pf); pf.IsValid() {
 			norm = append(norm, pf)
 		}
 	}
@@ -124,31 +126,10 @@ func (l *List) SetUser(p []netip.Prefix) {
 	l.mu.Unlock()
 }
 
-// normAddr unmaps IPv4-mapped IPv6 and drops any zone so that every
-// representation of one host compares equal.
-func normAddr(a netip.Addr) netip.Addr {
-	return a.Unmap().WithZone("")
-}
-
-// normPrefix returns p masked, with an IPv4-mapped IPv6 prefix of at least
-// 96 bits converted to the equivalent IPv4 prefix. Invalid prefixes yield the
-// zero Prefix.
-func normPrefix(p netip.Prefix) netip.Prefix {
-	if !p.IsValid() {
-		return netip.Prefix{}
-	}
-	a := p.Addr().WithZone("")
-	bits := p.Bits()
-	if a.Is4In6() && bits >= 96 {
-		a, bits = a.Unmap(), bits-96
-	}
-	return netip.PrefixFrom(a, bits).Masked()
-}
-
 func addrSet(addrs []netip.Addr) map[netip.Addr]struct{} {
 	set := make(map[netip.Addr]struct{}, len(addrs))
 	for _, a := range addrs {
-		if a = normAddr(a); a.IsValid() {
+		if a = netutil.NormAddr(a); a.IsValid() {
 			set[a] = struct{}{}
 		}
 	}
