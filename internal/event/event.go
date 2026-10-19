@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// MaxField is the longest string field, in runes, that Ostrakon keeps from a
+// log line (tracker) or sends to Jev (judge.MaxField).
+const MaxField = 128
+
 // Kind classifies what a log line told us about a source IP.
 type Kind string
 

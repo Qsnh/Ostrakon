@@ -2,9 +2,12 @@ package tracker
 
 import (
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 
 	"ostrakon/internal/event"
 )
@@ -48,7 +51,7 @@ func mustTrigger(t *testing.T, tr *Tracker, ev event.Event) Batch {
 }
 
 func TestDefaultConfig(t *testing.T) {
-	want := Config{Window: 10 * time.Minute, BenignTTL: time.Hour, MaxEvents: 50, PerIPCap: 400, MaxIPs: 100000}
+	want := Config{Window: 10 * time.Minute, BenignTTL: time.Hour, MaxEvents: 50, PerIPCap: 400, MaxIPs: 100000, MaxTotalEvents: 200000}
 	if got := DefaultConfig(); got != want {
 		t.Fatalf("DefaultConfig() = %+v, want %+v", got, want)
 	}
@@ -651,4 +654,183 @@ func TestConcurrentUse(t *testing.T) {
 	wg.Wait()
 	close(stop)
 	<-pruneDone
+}
+
+// within reports whether s's bytes live inside buf's backing array.
+func within(s, buf string) bool {
+	if len(s) == 0 || len(buf) == 0 {
+		return false
+	}
+	p := uintptr(unsafe.Pointer(unsafe.StringData(s)))
+	lo := uintptr(unsafe.Pointer(unsafe.StringData(buf)))
+	return p >= lo && p < lo+uintptr(len(buf))
+}
+
+// storedEvents counts every event the tracker holds, and checks that its
+// running total agrees.
+func storedEvents(t *testing.T, tr *Tracker) int {
+	t.Helper()
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	n := 0
+	for _, el := range tr.ips {
+		n += el.Value.(*ipState).size()
+	}
+	if n != tr.total {
+		t.Fatalf("tracker total = %d, but it holds %d events", tr.total, n)
+	}
+	return n
+}
+
+// A stored event keeps at most MaxField runes per string field, in its own
+// memory: a 16 KiB attacker line must not stay alive through a substring.
+func TestStoredEventIsCompact(t *testing.T) {
+	raw := strings.Repeat("A", 16<<10) // stands for the whole log line
+	multi := strings.Repeat("é", 300)  // two bytes per rune
+	tr := New(DefaultConfig())
+	for i := 0; i < 10; i++ {
+		ev := web(ipA, sec(i), 404)
+		ev.Source = "nginx-access"
+		ev.Method = raw[100:103]
+		ev.Path = raw[1000:9000]
+		ev.UserAgent = multi
+		ev.User = raw[200:210]
+		if i < 9 {
+			mustNotTrigger(t, tr, ev)
+			continue
+		}
+		b := mustTrigger(t, tr, ev)
+		for _, got := range b.Events {
+			if n := utf8.RuneCountInString(got.Path); n != event.MaxField || got.Path != raw[1000:1000+event.MaxField] {
+				t.Fatalf("stored Path has %d runes, want the first %d", n, event.MaxField)
+			}
+			if got.UserAgent != strings.Repeat("é", event.MaxField) {
+				t.Fatalf("stored UserAgent = %d runes (valid UTF-8 %v), want %d whole runes",
+					utf8.RuneCountInString(got.UserAgent), utf8.ValidString(got.UserAgent), event.MaxField)
+			}
+			if got.Method != "AAA" || got.User != strings.Repeat("A", 10) {
+				t.Fatalf("short fields changed: Method %q User %q", got.Method, got.User)
+			}
+			for name, f := range map[string]string{"Path": got.Path, "Method": got.Method, "User": got.User} {
+				if within(f, raw) {
+					t.Errorf("stored %s still points into the raw line", name)
+				}
+			}
+		}
+	}
+}
+
+func TestCompactCutsEveryField(t *testing.T) {
+	long := strings.Repeat("x", 500)
+	tr := New(DefaultConfig())
+	var b Batch
+	for i := 0; i < 3; i++ {
+		ev := sshFail(ipA, sec(i))
+		ev.User, ev.Method, ev.Path, ev.UserAgent = long, long, long, long
+		ev.Source = "sshd"
+		if i < 2 {
+			mustNotTrigger(t, tr, ev)
+		} else {
+			b = mustTrigger(t, tr, ev)
+		}
+	}
+	for _, e := range b.Events {
+		for name, f := range map[string]string{"User": e.User, "Method": e.Method, "Path": e.Path, "UserAgent": e.UserAgent} {
+			if len(f) != event.MaxField {
+				t.Errorf("%s has %d bytes, want %d", name, len(f), event.MaxField)
+			}
+		}
+	}
+	// An unknown source label is attacker-independent today, but is cut too.
+	ev := sshFail(ipB, 0)
+	ev.Source = long
+	tr.Add(ev)
+	tr.mu.Lock()
+	st := tr.ips[ipB].Value.(*ipState)
+	tr.mu.Unlock()
+	for _, e := range st.all() {
+		if len(e.Source) != event.MaxField {
+			t.Errorf("Source has %d bytes, want %d", len(e.Source), event.MaxField)
+		}
+	}
+}
+
+func TestMaxTotalEvents(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxTotalEvents = 5
+	tr := New(cfg)
+	mustNotTrigger(t, tr, sshFail(ipA, 0))
+	mustNotTrigger(t, tr, sshFail(ipA, sec(1)))
+	mustNotTrigger(t, tr, sshFail(ipB, sec(2)))
+	mustNotTrigger(t, tr, sshFail(ipB, sec(3)))
+	mustNotTrigger(t, tr, web(ipC, sec(4), 200))
+	if n := storedEvents(t, tr); n != 5 {
+		t.Fatalf("stored %d events, want 5", n)
+	}
+	// The sixth event exceeds the budget: A, least recently active, goes.
+	mustNotTrigger(t, tr, web(ipC, sec(5), 200))
+	if n := storedEvents(t, tr); n > 5 {
+		t.Fatalf("stored %d events, budget is 5", n)
+	}
+	if n := tr.Len(); n != 2 {
+		t.Fatalf("Len() = %d, want 2 (A evicted)", n)
+	}
+	tr.mu.Lock()
+	_, hasA := tr.ips[ipA]
+	tr.mu.Unlock()
+	if hasA {
+		t.Fatal("A, the least recently active IP, was not the one evicted")
+	}
+	// B kept both of its events: one more is its third.
+	mustTrigger(t, tr, sshFail(ipB, sec(6)))
+	if n := storedEvents(t, tr); n > 5 {
+		t.Fatalf("stored %d events, budget is 5", n)
+	}
+
+	// Never above the budget, whatever the traffic.
+	for i := 0; i < 200; i++ {
+		ip := netip.AddrFrom4([4]byte{198, 51, 100, byte(i % 7)})
+		tr.Add(web(ip, sec(10+i), 404))
+		if n := storedEvents(t, tr); n > 5 {
+			t.Fatalf("after %d more events: stored %d, budget is 5", i+1, n)
+		}
+	}
+}
+
+// A single IP holding more than the whole budget is cut back to it, oldest
+// events first, rather than evicted while it is being added to.
+func TestMaxTotalEventsSingleIP(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxTotalEvents = 3
+	tr := New(cfg)
+	for i := 0; i < 10; i++ {
+		tr.Add(web(ipA, sec(i), 200))
+		if n := storedEvents(t, tr); n > 3 {
+			t.Fatalf("stored %d events, budget is 3", n)
+		}
+	}
+	if tr.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", tr.Len())
+	}
+	tr.mu.Lock()
+	evs := tr.ips[ipA].Value.(*ipState).all()
+	tr.mu.Unlock()
+	if len(evs) != 3 || !evs[0].Time.Equal(t0.Add(sec(7))) {
+		t.Fatalf("kept %d events starting at %v, want the newest 3 from 7s", len(evs), evs[0].Time.Sub(t0))
+	}
+}
+
+func TestTotalTracksPruneAndForget(t *testing.T) {
+	tr := New(DefaultConfig())
+	mustNotTrigger(t, tr, sshFail(ipA, 0))
+	mustNotTrigger(t, tr, sshFail(ipA, 8*time.Minute))
+	mustNotTrigger(t, tr, web(ipB, 0, 200))
+	tr.Prune(t0.Add(11 * time.Minute))
+	if n := storedEvents(t, tr); n != 1 {
+		t.Fatalf("stored %d events after Prune, want 1", n)
+	}
+	tr.Forget(ipA)
+	if n := storedEvents(t, tr); n != 0 {
+		t.Fatalf("stored %d events after Forget, want 0", n)
+	}
 }

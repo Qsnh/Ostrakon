@@ -7,6 +7,7 @@ import (
 	"container/list"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,10 @@ type Config struct {
 	MaxEvents int           // events per Batch (the newest ones)
 	PerIPCap  int           // events kept per IP
 	MaxIPs    int           // tracked IPs; least recently active is evicted
+
+	// MaxTotalEvents bounds the events held across all IPs; least recently
+	// active IPs are evicted to stay within it.
+	MaxTotalEvents int
 }
 
 // DefaultConfig returns the production configuration.
@@ -44,6 +49,8 @@ func DefaultConfig() Config {
 		MaxEvents: 50,
 		PerIPCap:  400,
 		MaxIPs:    100000,
+
+		MaxTotalEvents: 200000,
 	}
 }
 
@@ -58,9 +65,10 @@ type Batch struct {
 type Tracker struct {
 	cfg Config
 
-	mu  sync.Mutex
-	ips map[netip.Addr]*list.Element // element value is *ipState
-	lru *list.List                   // front = most recently active
+	mu    sync.Mutex
+	ips   map[netip.Addr]*list.Element // element value is *ipState
+	lru   *list.List                   // front = most recently active
+	total int                          // events held across all IPs
 }
 
 // ipState is everything remembered about one IP.
@@ -110,13 +118,18 @@ func New(cfg Config) *Tracker {
 	if cfg.MaxIPs <= 0 {
 		cfg.MaxIPs = def.MaxIPs
 	}
+	if cfg.MaxTotalEvents <= 0 {
+		cfg.MaxTotalEvents = def.MaxTotalEvents
+	}
 	return &Tracker{cfg: cfg, ips: make(map[netip.Addr]*list.Element), lru: list.New()}
 }
 
 // Add records ev and reports whether its IP now deserves a decision. The
 // current moment is ev.Time (or, for an out-of-order event, the newest time
 // seen), and only events less than Window old count. auth_success events are
-// neither stored nor counted.
+// neither stored nor counted. What is stored is a compact copy of ev (see
+// compact), and when the events held across all IPs exceed MaxTotalEvents the
+// least recently active IPs are forgotten.
 //
 // A true result marks the IP in flight: further events are stored but do not
 // trigger until Done or Forget.
@@ -127,21 +140,24 @@ func (t *Tracker) Add(ev event.Event) (Batch, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	var st *ipState
-	if el, ok := t.ips[ev.IP]; ok {
-		st = el.Value.(*ipState)
+	el, ok := t.ips[ev.IP]
+	if ok {
 		t.lru.MoveToFront(el)
 	} else {
 		for len(t.ips) >= t.cfg.MaxIPs {
 			t.evictOldest()
 		}
-		st = &ipState{ip: ev.IP}
-		t.ips[ev.IP] = t.lru.PushFront(st)
+		el = t.lru.PushFront(&ipState{ip: ev.IP})
+		t.ips[ev.IP] = el
 	}
+	st := el.Value.(*ipState)
 
-	st.insert(ev)
+	before := st.size()
+	st.insert(compact(ev))
 	st.expire(st.newest(), t.cfg.Window)
 	st.capTo(t.cfg.PerIPCap)
+	t.total += st.size() - before
+	t.enforceBudget(el)
 
 	if st.inFlight {
 		return Batch{}, false
@@ -203,7 +219,9 @@ func (t *Tracker) Prune(now time.Time) {
 	for el := t.lru.Front(); el != nil; {
 		next := el.Next()
 		st := el.Value.(*ipState)
+		before := st.size()
 		st.expire(now, t.cfg.Window)
+		t.total += st.size() - before
 		if st.benign && !now.Before(st.benignUntil) {
 			st.benign = false
 		}
@@ -219,6 +237,23 @@ func (t *Tracker) Len() int {
 	return len(t.ips)
 }
 
+// enforceBudget forgets least recently active IPs until the events held fit
+// in MaxTotalEvents. cur, the IP just added to and the most recently active,
+// is never evicted; if it alone is over budget its oldest events go instead.
+func (t *Tracker) enforceBudget(cur *list.Element) {
+	for t.total > t.cfg.MaxTotalEvents {
+		back := t.lru.Back()
+		if back == cur {
+			st := cur.Value.(*ipState)
+			before := st.size()
+			st.capTo(st.size() - (t.total - t.cfg.MaxTotalEvents))
+			t.total += st.size() - before
+			return
+		}
+		t.remove(back)
+	}
+}
+
 func (t *Tracker) evictOldest() {
 	if el := t.lru.Back(); el != nil {
 		t.remove(el)
@@ -226,7 +261,9 @@ func (t *Tracker) evictOldest() {
 }
 
 func (t *Tracker) remove(el *list.Element) {
-	delete(t.ips, el.Value.(*ipState).ip)
+	st := el.Value.(*ipState)
+	t.total -= st.size()
+	delete(t.ips, st.ip)
 	t.lru.Remove(el)
 }
 
@@ -235,6 +272,44 @@ func (t *Tracker) dropIfIdle(el *list.Element) {
 	if st := el.Value.(*ipState); len(st.events) == 0 && !st.inFlight && !st.benign {
 		t.remove(el)
 	}
+}
+
+// size is the number of events held.
+func (s *ipState) size() int { return len(s.events) }
+
+// all returns the events held, oldest first.
+func (s *ipState) all() []event.Event { return s.events }
+
+// compact returns ev with every string field cut to event.MaxField runes and
+// copied into its own memory. Extractors hand out substrings of the log line,
+// which may be 16 KiB long; storing those would keep every line alive.
+func compact(ev event.Event) event.Event {
+	switch ev.Source {
+	case sourceSSHD:
+		ev.Source = sourceSSHD
+	case sourceNginx:
+		ev.Source = sourceNginx
+	default:
+		ev.Source = cut(ev.Source)
+	}
+	ev.User = cut(ev.User)
+	ev.Method = cut(ev.Method)
+	ev.Path = cut(ev.Path)
+	ev.UserAgent = cut(ev.UserAgent)
+	return ev
+}
+
+// cut returns a private copy of the first event.MaxField runes of s.
+func cut(s string) string {
+	n := 0
+	for i := range s {
+		if n == event.MaxField {
+			s = s[:i]
+			break
+		}
+		n++
+	}
+	return strings.Clone(s)
 }
 
 // newest is the time of the latest event. The window must not be empty.

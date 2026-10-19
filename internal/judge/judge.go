@@ -19,8 +19,9 @@ import (
 const (
 	// MaxEvents is how many of an IP's most recent events are sent to Jev.
 	MaxEvents = 50
-	// MaxField is the longest string field sent to Jev, in runes.
-	MaxField = 128
+	// MaxField is the longest string field sent to Jev, in runes. The
+	// tracker already keeps no more than this of each field.
+	MaxField = event.MaxField
 	// DefaultThreshold is the is_attack probability at or above which an IP is banned.
 	DefaultThreshold = 0.8
 )
