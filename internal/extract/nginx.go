@@ -15,7 +15,9 @@ import (
 // The source IP is the first space-delimited field ($remote_addr) and nothing
 // else: the request, referer and user agent are attacker-controlled and are
 // never consulted for it. nginx escapes a literal '"' in those fields as
-// \x22, so splitting on '"' yields the quoted fields reliably. A line whose
+// \x22, so splitting on '"' yields the quoted fields reliably. Fields are
+// attributed by position (1st quoted: request, 2nd: referer, 3rd: user
+// agent); any further quoted fields are ignored. A line whose
 // first field is not an IP address (a hostname, "unix:", an address with a
 // zone) is rejected.
 //
@@ -60,9 +62,13 @@ func ParseNginxAccess(line string, now time.Time) (event.Event, bool) {
 		}
 	}
 
-	// The user agent is the last quoted field, provided it is not the request.
-	if closed >= 2 {
-		ev.UserAgent = parts[2*closed-1]
+	// The user agent is anchored by position: the third quoted field, after
+	// the request and the referer, as in the combined format. It is not "the
+	// last quoted field": formats such as nginx's stock "main" append
+	// "$http_x_forwarded_for", which is client-controlled and must not be
+	// reported as the user agent. Formats with fewer quoted fields yield "".
+	if closed >= 3 {
+		ev.UserAgent = parts[5]
 	}
 	return ev, true
 }
