@@ -807,6 +807,43 @@ func TestLoginDuringDecisionNotBanned(t *testing.T) {
 	}
 }
 
+// An address allowlisted while its batch waited for a worker is not sent
+// to Jev at all.
+func TestAllowlistedWhileQueuedNotJudged(t *testing.T) {
+	h := newHarness(t)
+	h.deps.Workers = 1
+	release := make(chan struct{})
+	var once sync.Once
+	h.dec.setAnswer(func(ip netip.Addr) (judge.Decision, error) {
+		if ip == netip.MustParseAddr("203.0.113.180") {
+			<-release
+		}
+		return banDecision, nil
+	})
+	h.start()
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	h.send(repeat(failLine("203.0.113.180"), 3)...)
+	waitFor(t, "the only worker to be busy", func() bool { return h.dec.countFor("203.0.113.180") == 1 })
+	const ip = "198.51.100.181"
+	h.send(repeat(failLine(ip), 3)...) // queued behind the busy worker
+	h.send(acceptedLine(ip))           // the administrator logs in meanwhile
+	h.barrier()
+	once.Do(func() { close(release) })
+
+	waitFor(t, "203.0.113.180 banned", func() bool { _, ok := h.banned("203.0.113.180"); return ok })
+	waitFor(t, "the queued batch to be dropped", func() bool {
+		return strings.Contains(h.logs.String(), `msg="no decision: the address is now allowlisted" ip=`+ip)
+	})
+	settle()
+	if n := h.dec.countFor(ip); n != 0 {
+		t.Errorf("Decide called %d times for an address allowlisted before its turn, want 0", n)
+	}
+	if _, ok := h.banned(ip); ok {
+		t.Error("the allowlisted address was banned")
+	}
+}
+
 func TestPeriodicPrune(t *testing.T) {
 	h := newHarness(t)
 	clock := &fakeClock{t: time.Now()}

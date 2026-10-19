@@ -368,6 +368,13 @@ func (d *Daemon) work(ctx context.Context, jobs <-chan tracker.Batch) {
 // tracker's in-flight decision: Done, or Forget after a ban.
 func (d *Daemon) decide(ctx context.Context, b tracker.Batch) {
 	ip := b.IP
+	if d.deps.Allow.Allowed(ip, d.deps.Now()) {
+		// Allowlisted while the batch waited for a worker: a successful
+		// login, a new session, or the administrator's allow.
+		d.log.Debug("no decision: the address is now allowlisted", "ip", ip)
+		d.tracker.Done(ip, true)
+		return
+	}
 	h := d.deps.Store.History(ip)
 	hist := judge.History{BanCount: h.Count, LastBan: h.Last}
 	var dec judge.Decision
