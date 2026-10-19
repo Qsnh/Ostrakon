@@ -69,7 +69,7 @@ jev:     2026-10-18T20:00:05Z ok
 - `status:` is `running`, `paused (reason: ..., since ...)` or `degraded (...)`, which means the last 5 or more decisions in a row failed without pausing protection. Both are explained under [When Jev is unavailable](#when-jev-is-unavailable).
 - `last:` is the latest decision and what came of it: `ban 1h`, `ban 1h failed: <error>`, `no ban`, `would ban 1h` (dry run) or `skipped (allowlisted)`.
 - `jev:` is the time and outcome of the latest Jev decision request, `ok` or `error: ...`.
-- A `firewall:` line appears only while there is a firewall problem (a ban that failed, a table that could not be checked or rebuilt) and shows the latest error.
+- A `firewall:` line appears only while there is a firewall problem (a ban that failed, a table that could not be checked or rebuilt) and shows the latest error. An address whose ban failed is not judged again for 5 minutes.
 
 ## Jev costs
 

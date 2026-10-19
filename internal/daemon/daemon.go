@@ -38,9 +38,10 @@ const (
 	// degradedAfter is how many decisions in a row may fail without pausing
 	// (rejected requests, unusable answers) before Status reports degraded.
 	degradedAfter = 5
-	// failureBackoff is how long an address whose decision failed waits
-	// before it may trigger another one, so that a request Jev keeps
-	// rejecting is not re-sent (and billed) for every new log line.
+	// failureBackoff is how long an address whose decision failed, or whose
+	// ban could not be applied, waits before it may trigger another decision,
+	// so that a request Jev keeps rejecting is not re-sent (and billed), nor
+	// a broken firewall repaired again, for every new log line.
 	failureBackoff = 5 * time.Minute
 	// queueFullLogEvery limits the "decision queue full" Warn.
 	queueFullLogEvery = time.Minute
@@ -499,9 +500,12 @@ func (d *Daemon) ban(ctx context.Context, ip netip.Addr, dec judge.Decision) {
 		err = d.deps.Firewall.Ban(ctx, ip, dec.Duration)
 	}
 	if err != nil {
-		d.log.Error("ban failed", "ip", ip, "err", err)
+		// Leave the address alone for a while: asking Jev again on its next
+		// line would bill another decision and run another repair that is
+		// likely to fail the same way.
+		d.log.Error("ban failed", "ip", ip, "err", err, "backoff", failureBackoff)
 		d.setFirewallErr("ban failed", err, false)
-		d.tracker.Done(ip, false)
+		d.tracker.Backoff(ip, failureBackoff)
 		d.recordDecision(ip, dec, verdict+" failed: "+err.Error())
 		return
 	}

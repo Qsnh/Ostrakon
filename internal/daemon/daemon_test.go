@@ -1386,6 +1386,46 @@ func TestBanRetrySkipsAddressAllowlistedDuringRepair(t *testing.T) {
 	}
 }
 
+// Review R-2: an address whose ban cannot be applied, even after a repair,
+// is backed off like a failed decision. Released at once instead, every new
+// line from it was another billed Jev call and another full repair.
+func TestBanFailureBacksOff(t *testing.T) {
+	h := newHarness(t)
+	h.start() // the periodic check is a minute away: only failed bans repair
+	h.barrier()
+	boom := errors.New("nft: Error: Could not process rule: Operation not permitted")
+	h.fw.Mu.Lock()
+	h.fw.Err = boom // from now on every firewall call fails
+	h.fw.Mu.Unlock()
+
+	const ip = "203.0.113.165"
+	h.send(repeat(failLine(ip), 3)...)
+	waitFor(t, "the failed ban recorded", func() bool { return strings.Contains(h.d.Status().LastDecision, ip) })
+	for range 10 {
+		h.send(failLine(ip))
+		time.Sleep(2 * time.Millisecond) // let a (wrongly) queued decision run
+	}
+	h.barrier()
+	settle()
+
+	if n := h.dec.countFor(ip); n != 1 {
+		t.Errorf("Decide called %d times for 13 lines from one address, want 1", n)
+	}
+	h.fw.Mu.Lock()
+	ensures := h.fw.EnsureCalls
+	h.fw.Mu.Unlock()
+	if ensures != 2 {
+		t.Errorf("EnsureCalls = %d, want 2 (start-up and the one repair attempt)", ensures)
+	}
+	st := h.d.Status()
+	if want := " " + ip + " ssh_bruteforce p=0.93 ban 1h failed: " + boom.Error(); !strings.HasSuffix(st.LastDecision, want) {
+		t.Errorf("LastDecision = %q, want suffix %q", st.LastDecision, want)
+	}
+	if !strings.Contains(st.Firewall, boom.Error()) {
+		t.Errorf("Status().Firewall = %q, want the nft error", st.Firewall)
+	}
+}
+
 // A periodic check that cannot run is shown, and logged once rather than
 // every minute.
 func TestFirewallCheckErrorShown(t *testing.T) {
