@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -222,7 +227,123 @@ func TestContextPassedToRunner(t *testing.T) {
 	}
 }
 
+// cmdRecorder is a CmdRunner that remembers its arguments and answers err.
+type cmdRecorder struct {
+	args [][]string
+	err  error
+}
+
+func (c *cmdRecorder) run(_ context.Context, args ...string) error {
+	c.args = append(c.args, args)
+	return c.err
+}
+
+func TestPresent(t *testing.T) {
+	notFound := errors.New("nft: exit status 1: Error: No such file or directory; did you mean table 'ostrakon' in family ip?\n" +
+		"list table inet ostrakon\n                 ^^^^^^^^")
+	denied := errors.New("nft: exit status 1: Error: Operation not permitted")
+	tests := []struct {
+		name    string
+		err     error
+		present bool
+		wantErr bool
+	}{
+		{"listed", nil, true, false},
+		{"no such table", notFound, false, false},
+		{"other failure", denied, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, c := &recorder{}, &cmdRecorder{err: tt.err}
+			n := &NFT{Run: r.run, Cmd: c.run}
+			present, err := n.Present(context.Background())
+			if present != tt.present || (err != nil) != tt.wantErr {
+				t.Fatalf("Present = %v, %v; want %v, error %v", present, err, tt.present, tt.wantErr)
+			}
+			if tt.wantErr && !errors.Is(err, denied) {
+				t.Errorf("error %v does not wrap the command's", err)
+			}
+			if want := [][]string{{"list", "table", "inet", "ostrakon"}}; !reflect.DeepEqual(c.args, want) {
+				t.Errorf("command args = %q, want %q", c.args, want)
+			}
+			if len(r.scripts) != 0 {
+				t.Errorf("Present ran an nft script: %q", r.scripts)
+			}
+		})
+	}
+}
+
+// ExecCmd runs the nft on PATH with the arguments, drops what it prints on
+// stdout (a listing of every ban) and reports its stderr on failure. A stub
+// nft stands in for the real one.
+func TestExecCmdWithStubNFT(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a shell")
+	}
+	dir := t.TempDir()
+	stub := "#!/bin/sh\n" +
+		"[ \"$*\" = \"list table inet ostrakon\" ] || { echo \"Error: unexpected arguments: $*\" >&2; exit 1; }\n" +
+		"if [ -n \"$STUB_MISSING\" ]; then echo \"Error: No such file or directory; did you mean table 'ostrakon' in family ip?\" >&2; exit 1; fi\n" +
+		"echo 'table inet ostrakon {'\n"
+	if err := os.WriteFile(filepath.Join(dir, "nft"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	n := &NFT{Run: ExecRunner, Cmd: ExecCmd}
+
+	t.Setenv("STUB_MISSING", "")
+	if present, err := n.Present(context.Background()); !present || err != nil {
+		t.Fatalf("Present = %v, %v; want true, nil", present, err)
+	}
+	t.Setenv("STUB_MISSING", "1")
+	if present, err := n.Present(context.Background()); present || err != nil {
+		t.Fatalf("Present = %v, %v; want false, nil", present, err)
+	}
+	err := ExecCmd(context.Background(), "list", "ruleset")
+	if err == nil || !strings.Contains(err.Error(), "unexpected arguments: list ruleset") {
+		t.Fatalf("ExecCmd error = %v, want the stub's stderr", err)
+	}
+}
+
 // --- Fake ---
+
+func TestFakeMissing(t *testing.T) {
+	f := NewFake()
+	ctx := context.Background()
+	ip := netip.MustParseAddr("203.0.113.7")
+	if present, err := f.Present(ctx); !present || err != nil {
+		t.Fatalf("Present = %v, %v; want true, nil", present, err)
+	}
+	f.Missing = true
+	if present, err := f.Present(ctx); present || err != nil {
+		t.Fatalf("Present with Missing = %v, %v; want false, nil", present, err)
+	}
+	// Like nft, no element can be added to or removed from a missing table.
+	if err := f.Ban(ctx, ip, time.Hour); err == nil {
+		t.Fatal("Ban succeeded on a missing table")
+	}
+	if err := f.Unban(ctx, ip); err == nil {
+		t.Fatal("Unban succeeded on a missing table")
+	}
+	if err := f.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if f.Missing {
+		t.Fatal("Ensure did not rebuild the table")
+	}
+	if err := f.Ban(ctx, ip, time.Hour); err != nil {
+		t.Fatalf("Ban after Ensure: %v", err)
+	}
+	// A failing Ensure rebuilds nothing.
+	f.Missing = true
+	f.Err = errors.New("injected")
+	if err := f.Ensure(ctx); err == nil || !f.Missing {
+		t.Fatalf("failing Ensure = %v, Missing = %v; want an error and still missing", err, f.Missing)
+	}
+	if _, err := f.Present(ctx); !errors.Is(err, f.Err) {
+		t.Fatalf("Present with Err = %v, want %v", err, f.Err)
+	}
+}
 
 func TestFakeRecordsAndNormalises(t *testing.T) {
 	f := NewFake()

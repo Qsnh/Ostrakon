@@ -143,6 +143,25 @@ func TestCLIStatusDegraded(t *testing.T) {
 	}
 }
 
+// A firewall problem gets its own line, shown only while there is one.
+func TestCLIStatusFirewall(t *testing.T) {
+	_, stdout, _, _ := cliRun(t, []string{"status"}, true, statusResp(daemon.Status{
+		LastDecision: "2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h failed: nft: Operation not permitted",
+		LastJev:      "2026-10-18T20:00:05Z ok",
+		Firewall:     "ban failed: nft: Operation not permitted\nsecond line",
+	}), nil)
+	want := "status:  running\n" +
+		"mode:    normal\n" +
+		"sources: -\n" +
+		"bans:    0\n" +
+		"last:    2026-10-18T20:00:05Z 203.0.113.7 ssh_bruteforce p=0.93 ban 1h failed: nft: Operation not permitted\n" +
+		"jev:     2026-10-18T20:00:05Z ok\n" +
+		"firewall: ban failed: nft: Operation not permitted second line\n"
+	if stdout != want {
+		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
+	}
+}
+
 func TestCLIStatusPausedOutranksDegraded(t *testing.T) {
 	_, stdout, _, _ := cliRun(t, []string{"status"}, true, statusResp(daemon.Status{
 		Paused:      true,

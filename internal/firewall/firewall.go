@@ -23,6 +23,10 @@ type Firewall interface {
 	// Unban lifts the ban on ip. Unbanning an address that is not banned is
 	// not an error.
 	Unban(ctx context.Context, ip netip.Addr) error
+	// Present reports whether Ostrakon's table exists. It is false, with no
+	// error, after something removed it (nft flush ruleset, a reload of the
+	// distribution's nftables service); an error means it could not tell.
+	Present(ctx context.Context) (bool, error)
 }
 
 // Available reports whether the nft binary is on PATH.

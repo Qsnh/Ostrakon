@@ -158,6 +158,9 @@ func printStatus(w io.Writer, s daemon.Status) {
 	}
 	fmt.Fprintf(w, "status:  %s\nmode:    %s\nsources: %s\nbans:    %d\nlast:    %s\njev:     %s\n",
 		status, mode, sources, s.BanCount, orDash(s.LastDecision), orDash(s.LastJev))
+	if s.Firewall != "" {
+		fmt.Fprintf(w, "firewall: %s\n", oneLine(s.Firewall))
+	}
 }
 
 // orDash makes s one line, or "-" when it is empty.

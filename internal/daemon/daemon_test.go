@@ -311,6 +311,7 @@ func TestBansAttacker(t *testing.T) {
 		t.Errorf("Decide(ip=%v, %d events, %+v), want (%s, 3 events, no history)", c.ip, len(c.events), c.history, ip)
 	}
 	waitFor(t, "the tracker to forget the banned IP", func() bool { return h.d.tracker.Len() == 0 })
+	waitFor(t, "the decision recorded", func() bool { return h.d.Status().LastDecision != "" })
 
 	st := h.d.Status()
 	if st.BanCount != 1 {
@@ -396,6 +397,7 @@ func TestDryRun(t *testing.T) {
 
 	h.send(repeat(failLine(ip), 3)...)
 	waitFor(t, `"would ban" logged`, func() bool { return strings.Contains(h.logs.String(), "msg=\"would ban\" ip="+ip) })
+	waitFor(t, "the decision recorded", func() bool { return h.d.Status().LastDecision != "" })
 
 	if n := h.bannedCount(); n != 0 {
 		t.Errorf("firewall holds %d bans in dry-run, want 0", n)
@@ -673,6 +675,10 @@ func TestLoginDuringDecisionNotBanned(t *testing.T) {
 	if n := h.bannedCount(); n != 0 {
 		t.Errorf("firewall holds %d bans, want 0: the address logged in successfully", n)
 	}
+	waitFor(t, "the decision recorded", func() bool { return h.d.Status().LastDecision != "" })
+	if got, want := h.d.Status().LastDecision, " 198.51.100.9 ssh_bruteforce p=0.93 skipped (allowlisted)"; !strings.HasSuffix(got, want) {
+		t.Errorf("LastDecision = %q, want suffix %q", got, want)
+	}
 }
 
 func TestPeriodicPrune(t *testing.T) {
@@ -876,4 +882,137 @@ func TestMalformedAnswerNotReaskedPerLine(t *testing.T) {
 	if st := h.d.Status(); st.JevFailures != 1 || st.Degraded != "" {
 		t.Errorf("Status() = %+v, want 1 failure and not degraded", st)
 	}
+}
+
+// Something removed the table at runtime (nft flush ruleset, a reload of
+// nftables.service): the periodic check rebuilds it and puts the bans back.
+func TestFirewallTableRebuiltWhenMissing(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	stored := netip.MustParseAddr("203.0.113.140")
+	if err := h.store.AddBan(state.Ban{IP: stored, Since: now.Add(-10 * time.Minute), Until: now.Add(50 * time.Minute), Category: "ssh_bruteforce"}); err != nil {
+		t.Fatal(err)
+	}
+	h.start(func(d *Daemon) { d.firewallCheckEvery = 5 * time.Millisecond })
+	h.send(repeat(failLine("203.0.113.141"), 3)...)
+	waitFor(t, "both bans stored", func() bool { return len(h.store.ActiveBans(time.Now())) == 2 })
+
+	h.fw.Mu.Lock()
+	h.fw.Missing = true // the table, and every ban in it, is gone
+	clear(h.fw.Banned)
+	ensures := h.fw.EnsureCalls
+	h.fw.Mu.Unlock()
+
+	waitFor(t, "the table rebuilt and both bans restored", func() bool {
+		h.fw.Mu.Lock()
+		defer h.fw.Mu.Unlock()
+		return !h.fw.Missing && h.fw.EnsureCalls > ensures && len(h.fw.Banned) == 2
+	})
+	if ttl, _ := h.banned("203.0.113.140"); ttl < 49*time.Minute || ttl > 50*time.Minute {
+		t.Errorf("restored ttl = %v, want the remaining ~50m", ttl)
+	}
+	if ttl, _ := h.banned("203.0.113.141"); ttl < 59*time.Minute || ttl > time.Hour {
+		t.Errorf("restored ttl = %v, want the remaining ~1h", ttl)
+	}
+	if !strings.Contains(h.logs.String(), `level=WARN msg="nftables table missing; rebuilding"`) {
+		t.Errorf("the rebuild was not logged at Warn:\n%s", h.logs.String())
+	}
+	if st := h.d.Status(); st.Firewall != "" {
+		t.Errorf("Status().Firewall = %q after a successful rebuild, want empty", st.Firewall)
+	}
+}
+
+// A failed ban repairs the table and tries once more.
+func TestBanFailureRepairsAndRetries(t *testing.T) {
+	h := newHarness(t)
+	h.start() // the periodic check is a minute away: only the failed ban can repair
+	h.barrier()
+	h.fw.Mu.Lock()
+	h.fw.Missing = true
+	h.fw.Mu.Unlock()
+
+	const ip = "203.0.113.150"
+	h.send(repeat(failLine(ip), 3)...)
+	waitFor(t, ip+" banned after the repair", func() bool { _, ok := h.banned(ip); return ok })
+	h.fw.Mu.Lock()
+	ensures := h.fw.EnsureCalls
+	h.fw.Mu.Unlock()
+	if ensures != 2 {
+		t.Errorf("EnsureCalls = %d, want 2 (start-up and the repair)", ensures)
+	}
+	waitFor(t, "the ban stored", func() bool { return len(h.store.ActiveBans(time.Now())) == 1 })
+	waitFor(t, "the decision recorded", func() bool { return h.d.Status().LastDecision != "" })
+	st := h.d.Status()
+	if want := " " + ip + " ssh_bruteforce p=0.93 ban 1h"; !strings.HasSuffix(st.LastDecision, want) {
+		t.Errorf("LastDecision = %q, want suffix %q", st.LastDecision, want)
+	}
+	if st.Firewall != "" {
+		t.Errorf("Status().Firewall = %q, want empty", st.Firewall)
+	}
+}
+
+// A ban that cannot be made is not reported as made.
+func TestBanFailureRecorded(t *testing.T) {
+	h := newHarness(t)
+	h.start()
+	h.barrier()
+	boom := errors.New("nft: Error: Could not process rule: Operation not permitted")
+	h.fw.Mu.Lock()
+	h.fw.Err = boom
+	h.fw.Mu.Unlock()
+
+	const ip = "203.0.113.160"
+	h.send(repeat(failLine(ip), 3)...)
+	waitFor(t, "the failed ban recorded", func() bool { return strings.Contains(h.d.Status().LastDecision, ip) })
+	settle()
+	st := h.d.Status()
+	if want := " " + ip + " ssh_bruteforce p=0.93 ban 1h failed: " + boom.Error(); !strings.HasSuffix(st.LastDecision, want) {
+		t.Errorf("LastDecision = %q, want suffix %q", st.LastDecision, want)
+	}
+	if !strings.Contains(st.Firewall, boom.Error()) {
+		t.Errorf("Status().Firewall = %q, want the nft error", st.Firewall)
+	}
+	if st.BanCount != 0 || len(h.store.ActiveBans(time.Now())) != 0 {
+		t.Errorf("a failed ban was recorded as active: %+v", h.store.ActiveBans(time.Now()))
+	}
+	h.fw.Mu.Lock()
+	ensures := h.fw.EnsureCalls
+	h.fw.Mu.Unlock()
+	if ensures != 2 {
+		t.Errorf("EnsureCalls = %d, want 2 (start-up and the repair attempt)", ensures)
+	}
+	if !strings.Contains(h.logs.String(), `level=ERROR msg="ban failed" ip=`+ip) {
+		t.Errorf("the failed ban was not logged at Error:\n%s", h.logs.String())
+	}
+
+	// The firewall works again: the next ban succeeds and clears the error.
+	h.fw.Mu.Lock()
+	h.fw.Err = nil
+	h.fw.Mu.Unlock()
+	h.send(repeat(failLine("203.0.113.161"), 3)...)
+	waitFor(t, "203.0.113.161 banned", func() bool { _, ok := h.banned("203.0.113.161"); return ok })
+	waitFor(t, "the firewall error cleared", func() bool { return h.d.Status().Firewall == "" })
+}
+
+// A periodic check that cannot run is shown, and logged once rather than
+// every minute.
+func TestFirewallCheckErrorShown(t *testing.T) {
+	h := newHarness(t)
+	h.start(func(d *Daemon) { d.firewallCheckEvery = 5 * time.Millisecond })
+	h.barrier()
+	boom := errors.New("nft: exec: \"nft\": executable file not found in $PATH")
+	h.fw.Mu.Lock()
+	h.fw.Err = boom
+	h.fw.Mu.Unlock()
+	waitFor(t, "the check error in Status", func() bool { return strings.Contains(h.d.Status().Firewall, boom.Error()) })
+	time.Sleep(30 * time.Millisecond) // several more ticks
+	if n := strings.Count(h.logs.String(), `msg="cannot check the nftables table"`); n != 1 {
+		t.Errorf("check failure logged %d times, want once", n)
+	}
+
+	// The check works again: the error goes away.
+	h.fw.Mu.Lock()
+	h.fw.Err = nil
+	h.fw.Mu.Unlock()
+	waitFor(t, "the check error cleared", func() bool { return h.d.Status().Firewall == "" })
 }

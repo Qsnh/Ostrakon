@@ -43,10 +43,11 @@ const (
 	// rejecting is not re-sent (and billed) for every new log line.
 	failureBackoff = 5 * time.Minute
 
-	sessionsRefresh      = 30 * time.Second
-	localRefresh         = 5 * time.Minute
-	trackerPruneInterval = time.Minute
-	storePruneInterval   = time.Hour
+	sessionsRefresh       = 30 * time.Second
+	localRefresh          = 5 * time.Minute
+	trackerPruneInterval  = time.Minute
+	storePruneInterval    = time.Hour
+	firewallCheckInterval = time.Minute
 )
 
 // Decider is the part of *judge.Judge the daemon needs.
@@ -91,6 +92,8 @@ type Status struct {
 	JevFailures int `json:"jev_failures,omitempty"`
 	// Degraded is set once JevFailures reaches 5, until a decision succeeds.
 	Degraded string `json:"degraded,omitempty"`
+	// Firewall is empty while the firewall works, else its latest error.
+	Firewall string `json:"firewall,omitempty"`
 }
 
 // Daemon is the running pipeline. Status, Bans, Unban, Allow and Disallow
@@ -102,11 +105,12 @@ type Daemon struct {
 	sources []string
 
 	// Production values set by New; tests in this package shorten them.
-	queueCap          int
-	sessionsEvery     time.Duration
-	localEvery        time.Duration
-	trackerPruneEvery time.Duration
-	storePruneEvery   time.Duration
+	queueCap           int
+	sessionsEvery      time.Duration
+	localEvery         time.Duration
+	trackerPruneEvery  time.Duration
+	storePruneEvery    time.Duration
+	firewallCheckEvery time.Duration
 
 	wg sync.WaitGroup // every goroutine Run starts
 
@@ -115,12 +119,18 @@ type Daemon struct {
 	// with a stale list.
 	allowMu sync.Mutex
 
+	// repairMu lets one firewall repair run at a time: a vanished table
+	// makes every concurrent ban fail, and one rebuild is enough.
+	repairMu sync.Mutex
+
 	mu           sync.Mutex
 	probing      bool // a prober goroutine is running
 	lastDecision string
 	lastJev      string
 	jevFailures  int    // decisions in a row that failed without pausing
 	degraded     string // set once jevFailures reaches degradedAfter
+	firewallErr  string // Status().Firewall
+	checkFailing bool   // firewallErr came from the periodic check
 }
 
 // New returns a Daemon for d. Nothing runs until Run.
@@ -142,15 +152,16 @@ func New(d Deps) *Daemon {
 		sources = append(sources, sourceLabel(s))
 	}
 	return &Daemon{
-		deps:              d,
-		log:               d.Log,
-		tracker:           tracker.New(tracker.DefaultConfig()),
-		sources:           sources,
-		queueCap:          jobQueueCap,
-		sessionsEvery:     sessionsRefresh,
-		localEvery:        localRefresh,
-		trackerPruneEvery: trackerPruneInterval,
-		storePruneEvery:   storePruneInterval,
+		deps:               d,
+		log:                d.Log,
+		tracker:            tracker.New(tracker.DefaultConfig()),
+		sources:            sources,
+		queueCap:           jobQueueCap,
+		sessionsEvery:      sessionsRefresh,
+		localEvery:         localRefresh,
+		trackerPruneEvery:  trackerPruneInterval,
+		storePruneEvery:    storePruneInterval,
+		firewallCheckEvery: firewallCheckInterval,
 	}
 }
 
@@ -172,7 +183,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.deps.Firewall.Ensure(ctx); err != nil {
 		return fmt.Errorf("setting up the firewall: %w", err)
 	}
-	d.restoreBans(ctx)
+	if err := d.restoreBans(ctx); err != nil {
+		d.setFirewallErr("cannot restore bans", err, false)
+	}
 	d.syncAllow()
 	// Before the first line, so the administrator is protected from the start.
 	d.refreshSessions()
@@ -216,10 +229,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 // restoreBans puts the unexpired bans from the state file back into the
-// firewall (its sets are empty after a reboot) with their remaining time.
-func (d *Daemon) restoreBans(ctx context.Context) {
+// firewall (its sets are empty after a reboot, or after the table was
+// rebuilt) with their remaining time. It returns the first error, having
+// tried every ban.
+func (d *Daemon) restoreBans(ctx context.Context) error {
 	now := d.deps.Now()
 	restored := 0
+	var first error
 	for _, b := range d.deps.Store.ActiveBans(now) {
 		left := b.Until.Sub(now)
 		if left < minRestoreTTL {
@@ -227,6 +243,9 @@ func (d *Daemon) restoreBans(ctx context.Context) {
 		}
 		if err := d.deps.Firewall.Ban(ctx, b.IP, left); err != nil {
 			d.log.Error("cannot restore ban", "ip", b.IP, "until", b.Until, "err", err)
+			if first == nil {
+				first = err
+			}
 			continue
 		}
 		restored++
@@ -234,6 +253,71 @@ func (d *Daemon) restoreBans(ctx context.Context) {
 	if restored > 0 {
 		d.log.Info("restored bans", "count", restored)
 	}
+	return first
+}
+
+// checkFirewall is the periodic check that Ostrakon's nftables table still
+// exists: `nft flush ruleset` or a reload of the distribution's nftables
+// service removes it, and every ban with it. A missing table is rebuilt and
+// the stored bans are put back.
+func (d *Daemon) checkFirewall(ctx context.Context) {
+	present, err := d.deps.Firewall.Present(ctx)
+	if ctx.Err() != nil {
+		return // shutting down
+	}
+	if err != nil {
+		if d.setFirewallErr("cannot check the nftables table", err, true) {
+			d.log.Warn("cannot check the nftables table", "err", err)
+		}
+		return
+	}
+	if !present {
+		d.log.Warn("nftables table missing; rebuilding")
+		d.repairFirewall(ctx)
+		return
+	}
+	d.mu.Lock()
+	if d.checkFailing {
+		d.firewallErr, d.checkFailing = "", false
+	}
+	d.mu.Unlock()
+}
+
+// repairFirewall rebuilds the table (Ensure keeps whatever is still in it)
+// and restores the stored bans. A failure is shown in Status().Firewall and
+// logged when it differs from the previous one; success clears it.
+func (d *Daemon) repairFirewall(ctx context.Context) {
+	d.repairMu.Lock()
+	defer d.repairMu.Unlock()
+	if err := d.deps.Firewall.Ensure(ctx); err != nil {
+		if d.setFirewallErr("cannot rebuild the nftables table", err, false) {
+			d.log.Error("cannot rebuild the nftables table", "err", err)
+		}
+		return
+	}
+	if err := d.restoreBans(ctx); err != nil {
+		d.setFirewallErr("cannot restore bans", err, false)
+		return
+	}
+	d.clearFirewallErr()
+}
+
+// setFirewallErr makes "what: err" Status().Firewall and reports whether
+// that changed it. fromCheck marks an error of the periodic check, which the
+// next successful check clears.
+func (d *Daemon) setFirewallErr(what string, err error, fromCheck bool) bool {
+	s := what + ": " + err.Error()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	changed := d.firewallErr != s
+	d.firewallErr, d.checkFailing = s, fromCheck
+	return changed
+}
+
+func (d *Daemon) clearFirewallErr() {
+	d.mu.Lock()
+	d.firewallErr, d.checkFailing = "", false
+	d.mu.Unlock()
 }
 
 // handle takes one log line through extraction, the allowlist and the
@@ -314,29 +398,45 @@ func (d *Daemon) decide(ctx context.Context, b tracker.Batch) {
 	}
 	d.noteJevSuccess()
 
-	d.recordDecision(ip, dec)
+	d.log.Info("decision", "ip", ip, "category", dec.Category, "attack_prob", dec.AttackProb,
+		"ban", dec.Ban, "duration", dec.Duration, "input_tokens", dec.InputTokens)
 	switch {
 	case !dec.Ban:
 		d.tracker.Done(ip, true)
+		d.recordDecision(ip, dec, "no ban")
 	case d.deps.Allow.Allowed(ip, d.deps.Now()):
 		// Allowlisted while Jev was deciding: a successful login, a new
 		// session, or the administrator's allow. Never ban those.
 		d.log.Info("not banning: the address is now allowlisted", "ip", ip)
 		d.tracker.Forget(ip)
+		d.recordDecision(ip, dec, "skipped (allowlisted)")
 	case d.deps.DryRun:
 		d.log.Info("would ban", "ip", ip, "category", dec.Category, "duration", dec.Duration)
 		d.tracker.Done(ip, true)
+		d.recordDecision(ip, dec, "would ban "+shortDuration(dec.Duration))
 	default:
 		d.ban(ctx, ip, dec)
 	}
 }
 
+// ban carries out a ban decision. A failed ban usually means the table has
+// gone, so the table is repaired and the ban tried once more.
 func (d *Daemon) ban(ctx context.Context, ip netip.Addr, dec judge.Decision) {
-	if err := d.deps.Firewall.Ban(ctx, ip, dec.Duration); err != nil {
+	verdict := "ban " + shortDuration(dec.Duration)
+	err := d.deps.Firewall.Ban(ctx, ip, dec.Duration)
+	if err != nil && ctx.Err() == nil {
+		d.log.Warn("ban failed; rebuilding the nftables table and trying again", "ip", ip, "err", err)
+		d.repairFirewall(ctx)
+		err = d.deps.Firewall.Ban(ctx, ip, dec.Duration)
+	}
+	if err != nil {
 		d.log.Error("ban failed", "ip", ip, "err", err)
+		d.setFirewallErr("ban failed", err, false)
 		d.tracker.Done(ip, false)
+		d.recordDecision(ip, dec, verdict+" failed: "+err.Error())
 		return
 	}
+	d.clearFirewallErr()
 	now := d.deps.Now()
 	until := now.Add(dec.Duration)
 	if err := d.deps.Store.AddBan(state.Ban{IP: ip, Since: now, Until: until, Category: dec.Category}); err != nil {
@@ -345,26 +445,18 @@ func (d *Daemon) ban(ctx context.Context, ip netip.Addr, dec judge.Decision) {
 	}
 	d.log.Info("banned", "ip", ip, "category", dec.Category, "duration", dec.Duration, "until", until)
 	d.tracker.Forget(ip)
+	d.recordDecision(ip, dec, verdict)
 }
 
-// recordDecision logs a decision and makes it Status().LastDecision.
-func (d *Daemon) recordDecision(ip netip.Addr, dec judge.Decision) {
-	d.log.Info("decision", "ip", ip, "category", dec.Category, "attack_prob", dec.AttackProb,
-		"ban", dec.Ban, "duration", dec.Duration, "input_tokens", dec.InputTokens)
-
-	verdict := "no ban"
-	if dec.Ban {
-		verdict = "ban " + shortDuration(dec.Duration)
-		if d.deps.DryRun {
-			verdict = "would " + verdict
-		}
-	}
+// recordDecision makes a decision and what came of it (outcome: "no ban",
+// "ban 1h", "ban 1h failed: ...", "skipped (allowlisted)") Status().LastDecision.
+func (d *Daemon) recordDecision(ip netip.Addr, dec judge.Decision, outcome string) {
 	category := dec.Category
 	if category == "" {
 		category = "-"
 	}
 	s := fmt.Sprintf("%s %s %s p=%.2f %s",
-		d.deps.Now().UTC().Format(time.RFC3339), ip, category, dec.AttackProb, verdict)
+		d.deps.Now().UTC().Format(time.RFC3339), ip, category, dec.AttackProb, outcome)
 	d.mu.Lock()
 	d.lastDecision = s
 	d.mu.Unlock()
@@ -472,6 +564,7 @@ func (d *Daemon) maintain(ctx context.Context) {
 		time.NewTicker(d.localEvery),
 		time.NewTicker(d.trackerPruneEvery),
 		time.NewTicker(d.storePruneEvery),
+		time.NewTicker(d.firewallCheckEvery),
 	}
 	defer func() {
 		for _, t := range tickers {
@@ -492,6 +585,8 @@ func (d *Daemon) maintain(ctx context.Context) {
 			if err := d.deps.Store.Prune(d.deps.Now()); err != nil {
 				d.log.Warn("cannot prune the state file", "err", err)
 			}
+		case <-tickers[4].C:
+			d.checkFirewall(ctx)
 		}
 	}
 }
@@ -547,6 +642,7 @@ func (d *Daemon) Status() Status {
 	st.LastJev = d.lastJev
 	st.JevFailures = d.jevFailures
 	st.Degraded = d.degraded
+	st.Firewall = d.firewallErr
 	return st
 }
 

@@ -34,6 +34,27 @@ func ExecRunner(ctx context.Context, script string) error {
 	return fmt.Errorf("nft: %w", err)
 }
 
+// CmdRunner runs one nft command given as its arguments. It exists, like
+// Runner, so tests can inject a recorder instead of running the real binary.
+type CmdRunner func(ctx context.Context, args ...string) error
+
+// ExecCmd runs `nft args...`. What nft prints on stdout is discarded (a
+// listing can hold every ban); on failure the error wraps the exec error and
+// carries nft's stderr.
+func ExecCmd(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "nft", args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return fmt.Errorf("nft: %w: %s", err, msg)
+	}
+	return fmt.Errorf("nft: %w", err)
+}
+
 // ensureScript builds the table, the two timeout sets and the drop rules.
 // "add" is a no-op for objects that already exist, so existing bans survive;
 // the chain is flushed first so repeated runs do not stack duplicate rules.
@@ -46,10 +67,11 @@ add rule inet ostrakon prerouting ip saddr @banned_v4 drop
 add rule inet ostrakon prerouting ip6 saddr @banned_v6 drop
 `
 
-// NFT is a Firewall backed by nftables. Run must be set (normally to
-// ExecRunner).
+// NFT is a Firewall backed by nftables. Run and Cmd must be set (normally to
+// ExecRunner and ExecCmd).
 type NFT struct {
 	Run Runner
+	Cmd CmdRunner
 }
 
 // Ensure implements Firewall.
@@ -58,6 +80,19 @@ func (n *NFT) Ensure(ctx context.Context) error {
 		return fmt.Errorf("ensure nftables ruleset: %w", err)
 	}
 	return nil
+}
+
+// Present implements Firewall by listing the table: nft answers "No such
+// file or directory" when it does not exist.
+func (n *NFT) Present(ctx context.Context) (bool, error) {
+	err := n.Cmd(ctx, "list", "table", "inet", "ostrakon")
+	switch {
+	case err == nil:
+		return true, nil
+	case strings.Contains(err.Error(), "No such file or directory"):
+		return false, nil
+	}
+	return false, fmt.Errorf("check nftables table: %w", err)
 }
 
 // Ban implements Firewall.

@@ -87,7 +87,7 @@ func runDaemon(args []string, stderr io.Writer) int {
 
 	d := daemon.New(daemon.Deps{
 		Specs:    specs,
-		Firewall: &firewall.NFT{Run: firewall.ExecRunner},
+		Firewall: &firewall.NFT{Run: firewall.ExecRunner, Cmd: firewall.ExecCmd},
 		Decider:  &judge.Judge{Client: client, Threshold: judge.DefaultThreshold},
 		Ping: func(ctx context.Context) error {
 			_, err := client.SystemOne(ctx, judge.PingRequest())
